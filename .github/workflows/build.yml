@@ -41,7 +41,17 @@ jobs:
         run: dist/pdftrans/pdftrans-cli.exe --self-test build/sample.pdf
       - name: Self-test the macOS build
         if: runner.os == 'macOS'
-        run: dist/pdftrans.app/Contents/MacOS/pdftrans-cli --self-test build/sample.pdf
+        run: |
+          dist/pdftrans.app/Contents/MacOS/pdftrans-cli --self-test build/sample.pdf
+          # The app must be a normal foreground app (keyboard input) that starts the GUI executable.
+          python - <<'PY'
+          import plistlib
+          info = plistlib.load(open("dist/pdftrans.app/Contents/Info.plist", "rb"))
+          print({k: info.get(k) for k in ("CFBundleExecutable", "LSBackgroundOnly", "NSPrincipalClass", "NSHighResolutionCapable")})
+          assert info["CFBundleExecutable"] == "pdftrans", info["CFBundleExecutable"]
+          assert info.get("LSBackgroundOnly") in (None, False), "LSBackgroundOnly would block keyboard input"
+          assert info.get("NSHighResolutionCapable") is True, "without it the window is drawn blurry on Retina screens"
+          PY
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: Compress-Archive -Path dist/pdftrans -DestinationPath ${{ matrix.name }}.zip

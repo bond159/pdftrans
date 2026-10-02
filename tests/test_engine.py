@@ -118,13 +118,14 @@ class EngineTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def job(self, llm, **kw):
+    def job(self, llm, src=None, on_batch=None, model=None, **kw):
         from pdftrans.engine import Job
 
         # A unique model name keeps BabelDOC's on-disk translation cache from leaking between runs.
-        st = Settings(base_url=llm.url, api_key="k", model=f"qwen-test-{uuid.uuid4().hex[:8]}",
+        st = Settings(base_url=llm.url, api_key="k", model=model or f"qwen-test-{uuid.uuid4().hex[:8]}",
                       output_dir=str(self.dir / "out"), auto_glossary=False, **kw)
-        return Job(self.src, st, store=Store(self.dir / "s.db"), layout=HeuristicLayoutModel(), skip_assets=True)
+        return Job(src or self.src, st, store=Store(self.dir / "s.db"), layout=HeuristicLayoutModel(), skip_assets=True,
+                   on_batch=on_batch)
 
     def test_translate_with_dual_output(self):
         with MockLLM() as llm:
@@ -157,6 +158,58 @@ class EngineTests(unittest.TestCase):
             with self.assertRaises(Cancelled):
                 job.run()
             self.assertLess(time.time() - started, 60)
+
+    def test_batches_are_reported_and_resumed(self):
+        from pdftrans.engine import Cancelled
+
+        src = self.dir / "book.pdf"
+        make_pdf(src, pages=6)  # batches of 3 and 3 pages
+        model = f"qwen-test-{uuid.uuid4().hex[:8]}"
+        work = self.dir / "out" / ".book.pdftrans-llm"
+        with MockLLM() as llm:
+            seen = []
+            job = self.job(llm, src=src, model=model, on_batch=lambda pages, path: (seen.append((pages, path.exists())), job.cancel()))
+            with self.assertRaises(Cancelled):
+                job.run()
+            self.assertEqual(seen, [([0, 1, 2], True)])
+            self.assertTrue((work / "part-0000.pdf").exists())  # kept for the next run
+
+            seen = []
+            requests = len(llm.requests)
+            result = self.job(llm, src=src, model=model, on_batch=lambda pages, path: seen.append(pages)).run()
+            self.assertEqual(seen, [[0, 1, 2], [3, 4, 5]])
+            self.assertEqual(pymupdf.open(result.mono).page_count, 6)
+            self.assertFalse(work.exists())
+            self.assertGreater(len(llm.requests), requests)
+
+    def test_contents_entries_keep_their_lines(self):
+        src = self.dir / "toc.pdf"
+        doc = pymupdf.open()
+        page = doc.new_page(width=612, height=792)
+        page.insert_text((72, 80), "Table of Contents", fontname="tibo", fontsize=24)
+        entries = []
+        y = 130
+        for chapter in (1, 2):
+            page.insert_text((72, y), f"Chapter {chapter}   Networks and the Internet", fontname="tibo", fontsize=12)
+            page.insert_text((520, y), str(chapter * 40), fontname="tibo", fontsize=12)
+            entries.append(str(chapter * 40))
+            y += 18
+            for k in range(1, 8):
+                number = str(chapter * 40 + k * 3)
+                page.insert_text((100, y), f"{chapter}.{k}", fontname="tiro", fontsize=10)
+                page.insert_text((130, y), f"Packet Switching Delay and Loss Part {k}", fontname="tiro", fontsize=10)
+                page.insert_text((520, y), number, fontname="tiro", fontsize=10)
+                entries.append(number)
+                y += 14
+        doc.save(src)
+        with MockLLM() as llm:
+            result = self.job(llm, src=src).run()
+        words = pymupdf.open(result.mono)[0].get_text("words")
+        right = sorted((w[4], round(w[1])) for w in words if w[0] > 480)
+        self.assertEqual(sorted(n for n, _ in right), sorted(entries))  # page numbers stay in their column
+        lines = {round(w[1]) for w in words if 90 < w[0] < 480 and w[1] > 110}
+        self.assertGreaterEqual(len(lines), len(entries))  # one line per entry, not one run-on paragraph
+        self.assertNotIn("Switching", " ".join(w[4] for w in words))
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 ROOT = Path(SPECPATH).parent
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 
 datas, binaries, hiddenimports = [], [], []
 for package in (
@@ -53,6 +53,10 @@ if sys.platform == "darwin":
         name="pdftrans.app",
         bundle_identifier="io.github.bond159.pdftrans",
         info_plist={
+            # BUNDLE takes "console" from the last executable in COLLECT, which is the console
+            # pdftrans-cli, and turns that into LSBackgroundOnly=True: macOS then treats the app
+            # as a background process whose windows never receive keyboard input.
+            "LSBackgroundOnly": False,
             "CFBundleDisplayName": "PDF英译中",
             "CFBundleShortVersionString": VERSION,
             "NSHighResolutionCapable": True,

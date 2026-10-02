@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import bisect
+import itertools
 import os
+import re
 import sys
 import threading
+from collections import OrderedDict
 from pathlib import Path
 
 import pymupdf
-from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices, QImage, QPixmap
+from PySide6.QtCore import QObject, QRect, QRegularExpression, Qt, QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QColor, QDesktopServices, QImage, QPainter, QPixmap, QRegularExpressionValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractScrollArea,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -42,7 +47,7 @@ from .config import ENGINES, PRESETS, PROOFREAD_MODES, output_paths, QWEN_MODELS
 from .qa import KINDS, Item, Report
 from .store import Store
 
-ZOOMS = ["适合宽度", "50%", "75%", "100%", "125%", "150%", "200%"]
+ZOOMS = ["适合宽度", "50%", "75%", "100%", "125%", "150%", "200%", "300%"]
 FONT_FAMILIES = {"auto": "自动（跟随原文）", "serif": "宋体风格（衬线）", "sans-serif": "黑体风格（无衬线）"}
 
 
@@ -50,6 +55,7 @@ class Worker(QObject):
     """Runs a translation job, or a connection test, off the GUI thread."""
 
     progress = Signal(float, str)
+    batch = Signal(list, object)  # original pages (0-based), PDF bytes of those translated pages
     done = Signal(object)
     failed = Signal(str)
 
@@ -78,7 +84,9 @@ class Worker(QObject):
             if self.test_only:
                 self.done.emit(test_connection(self.settings))
                 return
-            self.job = Job(self.src, self.settings, self.progress.emit)
+            # The batch file is read here: the job deletes its work folder when it finishes.
+            self.job = Job(self.src, self.settings, self.progress.emit,
+                           on_batch=lambda pages, path: self.batch.emit(list(pages), path.read_bytes()))
             if self.cancelled.is_set():
                 self.job.cancel()
             self.done.emit(self.job.run())
@@ -152,30 +160,237 @@ def fetch_models(settings: Settings) -> list[str]:
     return models
 
 
-def render_page(doc: pymupdf.Document, index: int, zoom: float) -> QPixmap:
-    pix = doc[index].get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
-    img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
-    return QPixmap.fromImage(img.copy())
+def open_pdf(path: str | Path) -> pymupdf.Document:
+    """Open a PDF from a copy in memory, so the file can be replaced or deleted while it is shown."""
+    return pymupdf.open(stream=Path(path).read_bytes(), filetype="pdf")
+
+
+class PageCanvas(QAbstractScrollArea):
+    """All pages in one continuous scroll, in one or two columns that scroll together.
+
+    Pages are drawn only when they come into view, at the screen's pixel density
+    (sharp on Retina / high-DPI screens), one page per event-loop turn so that
+    scrolling stays smooth.
+    """
+
+    MARGIN = 16
+    GAP = 14  # between pages
+    COL_GAP = 14  # between the two columns
+    CACHE = 30  # rendered pages kept in memory
+
+    page_changed = Signal(int)
+    zoom_step = Signal(int)  # +1 / -1 from Ctrl + mouse wheel
+
+    def __init__(self, preview: Preview):
+        super().__init__()
+        self.preview = preview
+        self.sizes: list[tuple[float, float]] = []  # page sizes in points
+        self.max_width = 1.0
+        self.zoom = 1.0
+        self.columns = 2
+        self.tops: list[int] = []
+        self.height_px = 0
+        self.width_px = 0
+        self.current = 0
+        # (serial, index) -> (scale, pixmap); a pixmap at another scale is drawn stretched until re-rendered
+        self.cache: OrderedDict[tuple[int, int], tuple[float, QPixmap]] = OrderedDict()
+        self.wanted: list[tuple[pymupdf.Document, int, int, float]] = []
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self._render_next)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.verticalScrollBar().valueChanged.connect(self._scrolled)
+        self.horizontalScrollBar().valueChanged.connect(lambda _: self.viewport().update())
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    # ----- geometry ---------------------------------------------------------
+    def set_pages(self, sizes: list[tuple[float, float]]) -> None:
+        self.sizes = sizes
+        self.max_width = max((w for w, _ in sizes), default=1.0)
+        self.cache.clear()
+        self.current = 0
+        self.relayout()
+
+    def fit_zoom(self) -> float:
+        free = self.viewport().width() - 2 * self.MARGIN - (self.columns - 1) * self.COL_GAP
+        return max(0.1, free / self.columns / self.max_width)
+
+    def relayout(self, keep: bool = True) -> None:
+        anchor = self._anchor() if keep and self.tops else None
+        self.tops, y = [], self.MARGIN
+        for _, h in self.sizes:
+            self.tops.append(y)
+            y += round(h * self.zoom) + self.GAP
+        self.height_px = y - self.GAP + self.MARGIN
+        col = round(self.max_width * self.zoom)
+        self.width_px = 2 * self.MARGIN + self.columns * col + (self.columns - 1) * self.COL_GAP
+        vbar, hbar = self.verticalScrollBar(), self.horizontalScrollBar()
+        vbar.setRange(0, max(0, self.height_px - self.viewport().height()))
+        vbar.setPageStep(self.viewport().height())
+        vbar.setSingleStep(40)
+        hbar.setRange(0, max(0, self.width_px - self.viewport().width()))
+        hbar.setPageStep(self.viewport().width())
+        if anchor is not None:
+            page, frac = anchor
+            vbar.setValue(self.tops[page] + round(frac * self.sizes[page][1] * self.zoom) - self.viewport().height() // 3)
+        self.viewport().update()
+
+    def _anchor(self) -> tuple[int, float]:
+        """The current page and how far into it the view is, to keep the place when zooming."""
+        y = self.verticalScrollBar().value() + self.viewport().height() // 3
+        page = max(0, bisect.bisect_right(self.tops, y) - 1)
+        height = self.sizes[page][1] * self.zoom if self.sizes else 1
+        return page, (y - self.tops[page]) / max(1.0, height)
+
+    def page_rect(self, page: int, column: int) -> QRect:
+        w, h = self.sizes[page]
+        col = round(self.max_width * self.zoom)
+        left = max(0, (self.viewport().width() - self.width_px) // 2) - self.horizontalScrollBar().value()
+        x = left + self.MARGIN + column * (col + self.COL_GAP) + (col - round(w * self.zoom)) // 2
+        y = self.tops[page] - self.verticalScrollBar().value()
+        return QRect(x, y, round(w * self.zoom), round(h * self.zoom))
+
+    def visible_pages(self) -> range:
+        if not self.tops:
+            return range(0)
+        y = self.verticalScrollBar().value()
+        first = max(0, bisect.bisect_right(self.tops, y) - 1)
+        last = bisect.bisect_right(self.tops, y + self.viewport().height())
+        return range(first, min(last + 1, len(self.tops)))  # one more page, rendered ahead
+
+    def go(self, page: int) -> None:
+        if self.tops:
+            page = max(0, min(page, len(self.tops) - 1))
+            self.verticalScrollBar().setValue(self.tops[page] - self.GAP // 2)
+            self._set_current(page)
+
+    def _scrolled(self, value: int) -> None:
+        if self.tops:
+            # The page under the upper third of the view counts as the current one.
+            self._set_current(max(0, bisect.bisect_right(self.tops, value + self.viewport().height() // 3) - 1))
+        self.viewport().update()
+
+    def _set_current(self, page: int) -> None:
+        if page != self.current:
+            self.current = page
+            self.page_changed.emit(page)
+
+    # ----- drawing ----------------------------------------------------------
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self.viewport())
+        painter.fillRect(self.viewport().rect(), QColor("#e6e6e6"))
+        if not self.sizes:
+            painter.setPen(QColor("#666"))
+            painter.drawText(self.viewport().rect(), Qt.AlignmentFlag.AlignCenter, "把英文 PDF 拖到窗口里，或点「选择 PDF…」")
+            return
+        dpr = self.devicePixelRatioF()
+        self.wanted = []
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        for page in self.visible_pages():
+            for column in range(self.columns):
+                rect = self.page_rect(page, column)
+                in_view = rect.intersects(self.viewport().rect())
+                if in_view:
+                    painter.fillRect(rect, QColor("#ffffff"))
+                    painter.setPen(QColor("#bdbdbd"))
+                    painter.drawRect(rect.adjusted(0, 0, -1, -1))
+                found = self.preview.source(column, page)
+                if isinstance(found, str):
+                    if in_view:
+                        painter.setPen(QColor("#888"))
+                        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, found)
+                    continue
+                doc, serial, index = found
+                scale = self.zoom * dpr
+                cached = self.cache.get((serial, index))
+                if cached is not None:
+                    self.cache.move_to_end((serial, index))
+                    if in_view:
+                        painter.drawPixmap(rect, cached[1])
+                if cached is None or abs(cached[0] - scale) > 1e-3:
+                    self.wanted.append((doc, serial, index, scale, in_view))
+                    if cached is None and in_view:
+                        painter.setPen(QColor("#aaa"))
+                        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, f"第 {page + 1} 页加载中…")
+        if self.wanted:
+            self.wanted.sort(key=lambda w: not w[4])  # pages in view before the one rendered ahead
+            self.timer.start(0)
+
+    def _render_next(self) -> None:
+        if not self.wanted:
+            return
+        doc, serial, index, scale, _ = self.wanted.pop(0)
+        try:
+            pix = doc[index].get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
+        except Exception:  # a damaged page: leave it blank instead of breaking the view
+            pix = None
+        pixmap = QPixmap()
+        if pix is not None:
+            img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+            pixmap = QPixmap.fromImage(img.copy())
+            pixmap.setDevicePixelRatio(self.devicePixelRatioF())
+        self.cache[(serial, index)] = (scale, pixmap)
+        self.cache.move_to_end((serial, index))
+        while len(self.cache) > self.CACHE:
+            self.cache.popitem(last=False)
+        self.viewport().update()  # draws it, and queues the next missing page
+
+    # ----- input ------------------------------------------------------------
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self.preview.viewport_resized()
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            delta = event.angleDelta().y()
+            if delta:
+                self.zoom_step.emit(1 if delta > 0 else -1)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        key = event.key()
+        if key == Qt.Key.Key_Home:
+            self.go(0)
+        elif key == Qt.Key.Key_End:
+            self.go(len(self.tops) - 1)
+        elif key in (Qt.Key.Key_PageDown, Qt.Key.Key_Space):
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() + self.viewport().height() - 40)
+        elif key == Qt.Key.Key_PageUp:
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - self.viewport().height() + 40)
+        else:
+            super().keyPressEvent(event)
 
 
 class Preview(QWidget):
-    """Two pages side by side, scrolling together. Each side shows the original or one of
-    the translations (large model, Google, Microsoft), so translations can be compared."""
+    """Reader for comparing the original with translations. Each column shows the
+    original or one translation (large model, Google, Microsoft); both scroll together.
+    Pages of a running translation appear batch by batch as they are finished."""
 
     ORIGINAL = "原文"
+    NONE = "（不显示）"
 
     def __init__(self):
         super().__init__()
         self.original: pymupdf.Document | None = None
-        # label -> (document, original page -> page in that document)
-        self.docs: dict[str, tuple[pymupdf.Document, dict[int, int]]] = {}
+        # label -> original page -> (document, serial, page in that document)
+        self.docs: dict[str, dict[int, tuple[pymupdf.Document, int, int]]] = {}
+        self.running: dict[str, set[int]] = {}  # label -> pages still being translated
+        self.serials = itertools.count()
         self.page = 0
 
         bar = QHBoxLayout()
-        self.prev_btn = QPushButton("◀ 上一页")
-        self.next_btn = QPushButton("下一页 ▶")
-        self.page_spin = QSpinBox()
+        self.prev_btn = QPushButton("◀")
+        self.next_btn = QPushButton("▶")
+        for b in (self.prev_btn, self.next_btn):
+            b.setFixedWidth(36)
+        self.prev_btn.setToolTip("上一页")
+        self.next_btn.setToolTip("下一页")
+        self.page_spin = latin_only(QSpinBox())
         self.page_spin.setMinimum(1)
+        self.page_spin.setKeyboardTracking(False)  # jump after Enter, not on every digit typed
+        self.page_spin.setToolTip("输入页码后按回车跳转")
         self.page_total = QLabel("/ 0")
         self.zoom = QComboBox()
         self.zoom.addItems(ZOOMS)
@@ -184,7 +399,7 @@ class Preview(QWidget):
         for box in (self.left_src, self.right_src):
             box.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
             box.setMinimumContentsLength(8)
-        for w in (self.prev_btn, self.page_spin, self.page_total, self.next_btn):
+        for w in (self.prev_btn, QLabel("第"), self.page_spin, self.page_total, self.next_btn):
             bar.addWidget(w)
         bar.addStretch()
         bar.addWidget(QLabel("左"))
@@ -194,113 +409,146 @@ class Preview(QWidget):
         bar.addWidget(QLabel("缩放"))
         bar.addWidget(self.zoom)
 
-        self.left = QLabel()
-        self.right = QLabel()
-        for label in (self.left, self.right):
-            label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
-            label.setStyleSheet("background: #ffffff; border: 1px solid #c8c8c8; color: #666;")
-        pages = QWidget()
-        row = QHBoxLayout(pages)
-        row.addWidget(self.left)
-        row.addWidget(self.right)
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setWidget(pages)
-
+        self.canvas = PageCanvas(self)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(bar)
-        layout.addWidget(self.scroll, 1)
+        layout.addWidget(self.canvas, 1)
 
         self.prev_btn.clicked.connect(lambda: self.go(self.page - 1))
         self.next_btn.clicked.connect(lambda: self.go(self.page + 1))
         self.page_spin.valueChanged.connect(lambda v: self.go(v - 1))
-        self.zoom.currentIndexChanged.connect(lambda _: self.refresh())
+        self.zoom.currentIndexChanged.connect(lambda _: self.apply_zoom())
         self.left_src.currentIndexChanged.connect(lambda _: self.refresh())
         self.right_src.currentIndexChanged.connect(lambda _: self.refresh())
-        self.left.setText("把英文 PDF 拖到窗口里，或点「选择 PDF…」")
-        self.right.setText("翻译完成后在这里显示中文版")
+        self.canvas.page_changed.connect(self._page_changed)
+        self.canvas.zoom_step.connect(self._zoom_step)
 
+    # ----- documents --------------------------------------------------------
     def set_original(self, path: str) -> None:
-        self.original = pymupdf.open(path)
-        self.docs = {self.ORIGINAL: (self.original, {i: i for i in range(self.original.page_count)})}
+        doc = pymupdf.open(path)
+        self.original = doc
+        serial = next(self.serials)
+        self.docs = {self.ORIGINAL: {i: (doc, serial, i) for i in range(doc.page_count)}}
+        self.running = {}
         self.page_spin.blockSignals(True)
-        self.page_spin.setMaximum(self.original.page_count)
+        self.page_spin.setMaximum(doc.page_count)
+        self.page_spin.setValue(1)
         self.page_spin.blockSignals(False)
-        self.page_total.setText(f"/ {self.original.page_count}")
-        self._fill_sources(left=self.ORIGINAL, right=self.ORIGINAL)
+        self.page_total.setText(f"/ {doc.page_count} 页")
+        self._fill_sources(left=self.ORIGINAL, right=self.NONE)
+        self.canvas.set_pages([(p.rect.width, p.rect.height) for p in doc])
+        self.apply_zoom()
         self.go(0)
 
     def add_translation(self, label: str, path: Path, pages: list[int], show: bool = True) -> None:
-        doc = pymupdf.open(path)
-        self.docs[label] = (doc, {p: i for i, p in enumerate(pages) if i < doc.page_count})
+        """Show a finished translation; replaces whatever was shown under this label."""
+        doc = open_pdf(path)
+        serial = next(self.serials)
+        self.docs[label] = {p: (doc, serial, i) for i, p in enumerate(pages) if i < doc.page_count}
+        self.running.pop(label, None)
+        self._show_label(label, show, pages)
+
+    def begin_live(self, label: str, pages: list[int]) -> None:
+        """A translation under this label has started: its pages appear as batches finish."""
+        self.docs[label] = {}
+        self.running[label] = set(pages)
+        self._show_label(label, True, [])
+
+    def add_batch(self, label: str, data: bytes, pages: list[int]) -> None:
+        doc = pymupdf.open(stream=data, filetype="pdf")
+        serial = next(self.serials)
+        first = not self.docs.get(label)
+        self.docs.setdefault(label, {}).update({p: (doc, serial, i) for i, p in enumerate(pages) if i < doc.page_count})
+        self.running.get(label, set()).difference_update(pages)
+        if first and self.right_src.currentText() == label and self.page not in self.docs[label]:
+            self.go(pages[0])
+        self.refresh()
+
+    def end_live(self, label: str) -> None:
+        self.running.pop(label, None)
+        self.refresh()
+
+    def _show_label(self, label: str, show: bool, pages: list[int]) -> None:
         right = label if show else self.right_src.currentText()
         self._fill_sources(left=self.left_src.currentText() or self.ORIGINAL, right=right)
-        if show and self.page not in self.docs[label][1] and pages:
+        if show and pages and self.page not in self.docs[label]:
             self.go(pages[0])
-        else:
-            self.refresh()
+        self.refresh()
 
     def _fill_sources(self, left: str, right: str) -> None:
-        for box, choice in ((self.left_src, left), (self.right_src, right)):
+        for box, choice, extra in ((self.left_src, left, []), (self.right_src, right, [self.NONE])):
             box.blockSignals(True)
             box.clear()
-            box.addItems(list(self.docs))
-            box.setCurrentText(choice if choice in self.docs else self.ORIGINAL)
+            box.addItems(list(self.docs) + extra)
+            box.setCurrentText(choice if choice in self.docs or choice in extra else self.ORIGINAL)
             box.blockSignals(False)
+
+    def source(self, column: int, page: int):
+        """What to draw in a column for an original page: (document, serial, index), or a message."""
+        label = (self.left_src if column == 0 else self.right_src).currentText()
+        found = self.docs.get(label, {}).get(page)
+        if found is not None:
+            return found
+        if page in self.running.get(label, ()):
+            return "正在翻译…\n完成后自动显示在这里"
+        if label in self.running:
+            return "此页不在本次翻译范围内"
+        return "此页不在翻译范围内"
 
     def go_translated(self, label: str, translated_page: int) -> None:
         """Show the original page whose translation (in document label) is translated_page."""
         if label in self.docs:
             self.right_src.setCurrentText(label)
-            for original, page in self.docs[label][1].items():
-                if page == translated_page:
+            for original, (_, _, index) in self.docs[label].items():
+                if index == translated_page:
                     self.go(original)
                     return
 
+    # ----- view -------------------------------------------------------------
     def go(self, page: int) -> None:
         if self.original is None:
             return
         self.page = max(0, min(page, self.original.page_count - 1))
-        self.page_spin.blockSignals(True)
-        self.page_spin.setValue(self.page + 1)
-        self.page_spin.blockSignals(False)
-        self.refresh()
+        self._sync_spin()
+        self.canvas.go(self.page)
 
-    def _zoom(self) -> float:
+    def _page_changed(self, page: int) -> None:
+        self.page = page
+        self._sync_spin()
+
+    def _sync_spin(self) -> None:
+        if not self.page_spin.hasFocus():
+            self.page_spin.blockSignals(True)
+            self.page_spin.setValue(self.page + 1)
+            self.page_spin.blockSignals(False)
+
+    def apply_zoom(self) -> None:
         choice = self.zoom.currentText()
-        if choice.endswith("%"):
-            return int(choice[:-1]) / 100
-        width = self.scroll.viewport().width() / 2 - 30
-        return max(0.2, width / self.original[self.page].rect.width)
+        self.canvas.columns = 1 if self.right_src.currentText() == self.NONE else 2
+        self.canvas.zoom = int(choice[:-1]) / 100 if choice.endswith("%") else self.canvas.fit_zoom()
+        self.canvas.relayout()
 
-    def _show(self, label: QLabel, source: str, zoom: float) -> None:
-        if source not in self.docs:
-            label.setPixmap(QPixmap())
-            label.setText("翻译完成后在这里显示中文版")
-            return
-        doc, page_map = self.docs[source]
-        if self.page in page_map:
-            label.setPixmap(render_page(doc, page_map[self.page], zoom))
+    def _zoom_step(self, step: int) -> None:
+        percents = [int(z[:-1]) for z in ZOOMS if z.endswith("%")]
+        now = self.canvas.zoom * 100
+        if step > 0:
+            target = next((p for p in percents if p > now + 1), percents[-1])
         else:
-            label.setPixmap(QPixmap())
-            label.setText("此页不在翻译范围内")
+            target = next((p for p in reversed(percents) if p < now - 1), percents[0])
+        self.zoom.setCurrentText(f"{target}%")
+
+    def viewport_resized(self) -> None:
+        if self.zoom.currentText() == ZOOMS[0]:
+            self.apply_zoom()
+        else:
+            self.canvas.relayout()
 
     def refresh(self) -> None:
-        if self.original is None:
-            return
-        zoom = self._zoom()
-        self._show(self.left, self.left_src.currentText(), zoom)
-        if len(self.docs) == 1:
-            self.right.setPixmap(QPixmap())
-            self.right.setText("翻译完成后在这里显示中文版")
-        else:
-            self._show(self.right, self.right_src.currentText(), zoom)
-
-    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
-        super().resizeEvent(event)
-        if self.zoom.currentText() == ZOOMS[0]:
-            self.refresh()
+        columns = 1 if self.right_src.currentText() == self.NONE else 2
+        if columns != self.canvas.columns:
+            self.apply_zoom()
+        self.canvas.viewport().update()
 
 
 class ReportView(QWidget):
@@ -451,6 +699,8 @@ class MainWindow(QMainWindow):
         self.worker: Worker | None = None
         self.result = None
         self.running_engine = "llm"
+        self._last_logged = ""
+        self.translating = False
         self._store: Store | None = None
 
         self.preview = Preview()
@@ -555,17 +805,14 @@ class MainWindow(QMainWindow):
         o.addRow("自动校对", self.proofread)
         self.dual = QCheckBox("同时输出左右双语对照版")
         o.addRow("输出", self.dual)
-        # Number boxes rather than free text: they take digits directly, whatever input method is active.
-        self.all_pages = QCheckBox("全部")
-        self.all_pages.setChecked(True)
-        self.page_from = QSpinBox()
-        self.page_to = QSpinBox()
-        for box in (self.page_from, self.page_to):
-            box.setRange(1, 1)
-            box.setEnabled(False)
-        self.all_pages.toggled.connect(lambda on: [b.setEnabled(not on) for b in (self.page_from, self.page_to)])
-        self.page_from.valueChanged.connect(lambda v: self.page_to.setMinimum(v))
-        o.addRow("页码范围", self._row(self.all_pages, QLabel("第"), self.page_from, QLabel("页 至 第"), self.page_to, QLabel("页")))
+        self.pages = latin_only(QLineEdit())
+        self.pages.setPlaceholderText("留空 = 全部页；例如 1-50 或 3,8,20-35")
+        self.pages.setValidator(QRegularExpressionValidator(QRegularExpression(r"[0-9,，\- ]*"), self.pages))
+        self.pages.setClearButtonEnabled(True)
+        self.pages.textChanged.connect(lambda _: self._show_page_count())
+        self.page_count = QLabel()
+        self.page_count.setStyleSheet("color: #777;")
+        o.addRow("页码范围", self._row(self.pages, self.page_count))
         self.glossary = QLineEdit()
         self.glossary.setPlaceholderText("可选：CSV 文件，两列 source,target")
         pick_glossary = QPushButton("…")
@@ -768,17 +1015,22 @@ class MainWindow(QMainWindow):
             self.status.setText(self.status.text() + "，已载入上次的结果：" + "、".join(found))
 
     def _page_spec(self) -> str:
-        if self.all_pages.isChecked() or self.preview.original is None:
-            return ""
-        return f"{self.page_from.value()}-{self.page_to.value()}"
+        return self.pages.text().strip().strip(",，-")
 
     def _reset_pages(self, count: int) -> None:
-        self.all_pages.setChecked(True)
-        for box in (self.page_from, self.page_to):
-            box.setMinimum(1)
-            box.setMaximum(count)
-        self.page_from.setValue(1)
-        self.page_to.setValue(count)
+        self.pages.clear()
+        self._show_page_count()
+
+    def _show_page_count(self) -> None:
+        if self.preview.original is None:
+            self.page_count.setText("")
+            return
+        total = self.preview.original.page_count
+        try:
+            n = len(parse_pages(self._page_spec(), total))
+            self.page_count.setText(f"共 {n} 页" if self._page_spec() else f"全部 {total} 页")
+        except ValueError:
+            self.page_count.setText("范围有误")
 
     def _pages_of(self, translated: Path) -> list[int]:
         """Original pages contained in a translated PDF, in order."""
@@ -811,6 +1063,7 @@ class MainWindow(QMainWindow):
         worker.moveToThread(self.job_thread)
         self.job_thread.started.connect(worker.run)
         worker.progress.connect(self.on_progress)
+        worker.batch.connect(self.on_batch)
         worker.done.connect(self.on_done)
         worker.failed.connect(self.on_failed)
         worker.done.connect(self.job_thread.quit)
@@ -861,6 +1114,10 @@ class MainWindow(QMainWindow):
         self.log.appendPlainText(f"开始翻译 {Path(self.src).name}，{what}")
         self.progress.setValue(0)
         self.running_engine = settings.engine
+        self._last_logged = ""
+        self.translating = True
+        self.tabs.setCurrentWidget(self.preview)
+        self.preview.begin_live(ENGINES[settings.engine], parse_pages(settings.pages, self.preview.original.page_count))
         self._run(Worker(self.src, settings))
 
     def cancel(self) -> None:
@@ -872,8 +1129,19 @@ class MainWindow(QMainWindow):
     def on_progress(self, pct: float, msg: str) -> None:
         self.progress.setValue(int(pct * 10))
         self.status.setText(f"{pct:.0f}%  {msg}")
-        if not msg.endswith("）"):  # keep per-item counters out of the log
-            self.log.appendPlainText(msg)
+        # Log each stage once: without its running counter and time estimate.
+        stage = re.sub(r"（\d+/\d+）|，全部预计.*$", "", msg)
+        if stage != self._last_logged:
+            self._last_logged = stage
+            self.log.appendPlainText(stage)
+
+    @Slot(list, object)
+    def on_batch(self, pages: list, data: bytes) -> None:
+        """A batch of pages is translated and proofread: show it right away."""
+        try:
+            self.preview.add_batch(ENGINES[self.running_engine], data, pages)
+        except Exception as e:  # the final PDF is shown at the end anyway
+            self.log.appendPlainText(f"无法预览第 {pages[0] + 1}–{pages[-1] + 1} 页：{e}")
 
     @Slot(object)
     def on_done(self, result) -> None:
@@ -908,12 +1176,17 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def on_failed(self, msg: str) -> None:
-        self.status.setText(msg if msg == "已取消" else f"失败：{msg}")
+        if self.translating:
+            self.preview.end_live(ENGINES[self.running_engine])
+            if self.preview.docs.get(ENGINES[self.running_engine]):
+                msg += "\n已完成的页面已保存：不改设置再点「开始翻译」，会从中断处继续。"
+        self.status.setText(msg if msg.startswith("已取消") else f"失败：{msg}")
         self.log.appendPlainText(msg)
-        if msg != "已取消":
+        if not msg.startswith("已取消"):
             QMessageBox.warning(self, "出错了", msg)
 
     def _job_ended(self) -> None:
+        self.translating = False
         self.set_busy(False)
         self.worker = None
         self.job_thread = None

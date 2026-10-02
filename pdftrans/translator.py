@@ -125,6 +125,9 @@ class Proofreader:
                     raise
                 time.sleep(delay)
                 delay = min(delay * 2, 30)
+        if not hasattr(resp, "choices"):
+            # A 200 answer that isn't JSON: usually a web page because the Base URL is incomplete.
+            raise RuntimeError(f"接口返回的不是大模型的回复（{str(resp)[:80]!r}），请检查 Base URL 是否完整，通常以 /v1 结尾")
         self.on_usage(resp)
         return (resp.choices[0].message.content or "").strip()
 

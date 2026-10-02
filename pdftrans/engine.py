@@ -12,10 +12,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from .config import Settings
+from .config import Settings, output_paths
 from .qa import Report, build_report
 from .store import Store
-from .translator import Journal, ProofreadingTranslator, role_prompt
+from .translator import Journal, make_translator, role_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -146,8 +146,16 @@ class Job:
         st = self.settings
         if not self.src.is_file():
             raise FileNotFoundError(f"文件不存在：{self.src}")
-        out_dir = Path(st.output_dir) if st.output_dir else self.src.parent
+        paths = output_paths(self.src, st.output_dir, st.engine)
+        out_dir = paths["mono"].parent
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        journal = Journal()
+        translator = make_translator(st, self.store, journal)
+        self.progress(0, "检查翻译服务连接…")
+        translator.preflight()
+        if self._cancelled.is_set():
+            raise Cancelled()
 
         high_level.init()
         if not self.skip_assets:
@@ -157,15 +165,13 @@ class Job:
         self.progress(0, "加载版面识别模型…")
         layout = self.layout or layout_model()
 
-        journal = Journal()
-        translator = ProofreadingTranslator(st, self.store, journal)
         table_model = None
         if st.translate_tables:
             from babeldoc.docvision.table_detection.rapidocr import RapidOCRModel
 
             table_model = RapidOCRModel()
-
-        work = out_dir / f".{self.src.stem}.pdftrans"
+        llm = st.engine == "llm"
+        work = out_dir / f".{self.src.stem}.pdftrans-{st.engine}"
         self.config = TranslationConfig(
             translator=translator,
             input_file=str(self.src),
@@ -182,8 +188,10 @@ class Job:
             watermark_output_mode=WatermarkOutputMode.NoWatermark,
             table_model=table_model,
             custom_system_prompt=role_prompt(st),
-            glossaries=_load_glossaries(st),
-            auto_extract_glossary=st.auto_glossary,
+            glossaries=_load_glossaries(st) if llm else [],
+            # Term extraction and style tags need an LLM; machine translation would mangle the tags.
+            auto_extract_glossary=st.auto_glossary and llm,
+            disable_rich_text_translate=not llm,
             ocr_workaround=st.ocr_workaround,
             primary_font_family=None if st.font_family == "auto" else st.font_family,
             only_include_translated_page=bool(st.pages),
@@ -192,19 +200,19 @@ class Job:
         getattr(layout, "init_font_mapper", lambda _c: None)(self.config)
 
         started = time.time()
-        result = asyncio.run(self._translate(high_level))
-        if result is None:
-            raise Cancelled()
-
-        stem = self.src.stem
-        mono = _rename(result.mono_pdf_path, out_dir / f"{stem}.zh-CN.pdf")
-        dual = _rename(result.dual_pdf_path, out_dir / f"{stem}.zh-CN.dual.pdf")
-        glossary = _rename(getattr(result, "auto_extracted_glossary_path", None), out_dir / f"{stem}.zh-CN.glossary.csv")
-        shutil.rmtree(work, ignore_errors=True)
+        try:
+            result = asyncio.run(self._translate(high_level))
+            if result is None:
+                raise Cancelled()
+            mono = _rename(result.mono_pdf_path, paths["mono"])
+            dual = _rename(result.dual_pdf_path, paths["dual"])
+            glossary = _rename(getattr(result, "auto_extracted_glossary_path", None), paths["glossary"])
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
         self.progress(100, "生成质检报告…")
         report = build_report(journal.all(), mono)
-        report.save(out_dir / f"{stem}.zh-CN.report.json")
+        report.save(paths["report"])
         self.progress(100, "完成")
         return JobResult(
             mono=mono,

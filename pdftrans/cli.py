@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .config import PROOFREAD_MODES, load_settings
+from .config import ENGINES, PROOFREAD_MODES, load_settings
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -14,6 +14,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="把英文 PDF 翻译成中文并保留原版面（BabelDOC 引擎 + 自动校对）。未给出的选项沿用图形界面保存的设置。",
     )
     p.add_argument("pdf", nargs="+", help="要翻译的 PDF 文件")
+    p.add_argument("--engine", choices=list(ENGINES), help="翻译引擎：llm（大模型）/ google / microsoft")
+    p.add_argument("--proxy", help="谷歌/微软翻译使用的网络代理，如 http://127.0.0.1:7890")
     p.add_argument("--base-url", help="OpenAI 兼容接口地址，默认阿里云百炼")
     p.add_argument("--api-key", help="API Key（也可用环境变量 DASHSCOPE_API_KEY）")
     p.add_argument("--model", help="翻译模型，如 qwen-plus")
@@ -30,6 +32,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     st = load_settings()
     for attr, value in [
+        ("engine", args.engine),
+        ("proxy", args.proxy),
         ("base_url", args.base_url),
         ("api_key", args.api_key),
         ("model", args.model),
@@ -42,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     ]:
         if value is not None:
             setattr(st, attr, value)
-    if not st.resolved_api_key():
+    if st.engine == "llm" and not st.resolved_api_key():
         print("缺少 API Key：用 --api-key 指定，或设置环境变量 DASHSCOPE_API_KEY", file=sys.stderr)
         return 2
 

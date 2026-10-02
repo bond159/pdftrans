@@ -7,7 +7,7 @@
 手动修改后重新生成。
 
 - 版面解析与排版引擎：[BabelDOC](https://github.com/funstory-ai/BabelDOC)（沉浸式翻译 PDF 功能背后的开源引擎）
-- 大模型：通义千问（阿里云百炼），也支持任何 OpenAI 兼容接口
+- 翻译引擎：大模型（通义千问 / 任何 OpenAI 兼容接口），或免费的谷歌翻译、微软翻译（必应），可以对比效果
 - 平台：Windows、macOS（也可以在 Linux 上从源码运行）
 
 ## 主要功能
@@ -21,6 +21,7 @@
 | 质检报告 | 列出被自动修正的段落和仍需人工检查的地方，双击跳到对应页面 |
 | 手动修改 | 在报告里改译文，重新生成 PDF 时只替换改过的段落，其余直接用缓存，不重复计费 |
 | 输出 | 默认只输出中文 PDF；可选同时输出左右双语对照版 |
+| 引擎对比 | 同一文件用不同引擎翻译的结果分别保存，预览区左右两侧可以任选原文或任一译文对比 |
 
 ## 安装
 
@@ -60,10 +61,26 @@ python -m pdftrans            # 图形界面
 模型建议：翻译用 `qwen-plus`（速度快、费用低），审校用 `qwen-max`（更强）。两个都可以在界面里改成
 任何百炼支持的模型名。开启大模型审校后，每段大约多一次调用，费用约为只翻译时的两倍。
 
+## 翻译引擎
+
+| 引擎 | 费用 | 说明 |
+| --- | --- | --- |
+| 大模型（推荐） | 按用量计费 | 效果最好；支持术语表、自动术语提取、大模型审校 |
+| 谷歌翻译 | 免费 | 中国大陆需要能访问谷歌的网络代理（填在「网络代理」，或留空使用系统代理） |
+| 微软翻译 / 必应 | 免费 | 国内一般可以直接使用 |
+
+- 谷歌、微软翻译使用的是浏览器插件常用的免费接口，不需要 Key，但大量使用可能被限速，接口也可能变动。
+- 使用谷歌、微软翻译时，填写了大模型 API Key 并选择「规则检查 + 大模型审校」，就会用大模型审校机器翻译的结果；
+  不填 Key 则只做规则检查，问题列在质检报告里。
+- 机器翻译不支持术语表和自动术语提取，段落内的粗体、斜体等局部格式也不保留（大模型可以）。
+- 不同引擎的结果分别保存为 `论文.zh-CN.pdf`（大模型）、`论文.zh-CN.google.pdf`、`论文.zh-CN.microsoft.pdf`，
+  在预览区上方的「左」「右」下拉框中选择要对比的版本。
+
 ## 使用
 
 1. 把英文 PDF 拖进窗口（或点「选择 PDF…」）。
-2. 填写 API Key，点「测试连接」确认能用。
+2. 选择翻译引擎。用大模型时填写 API Key（自定义接口时在「服务」里选「自定义 OpenAI 兼容接口」，再填 Base URL 和模型名），
+   点「测试连接」确认能用。
 3. 按需设置：页码范围、是否同时输出双语对照版、术语表、附加要求（如“这是一篇医学影像论文”）。
 4. 点「开始翻译」。右侧「预览」并排显示原文和中文版。
 5. 完成后看「质检报告」：
@@ -78,7 +95,7 @@ python -m pdftrans            # 图形界面
 
 | 文件 | 内容 |
 | --- | --- |
-| `论文.zh-CN.pdf` | 中文版 |
+| `论文.zh-CN.pdf` | 中文版（谷歌、微软翻译的文件名中带 `.google` / `.microsoft`） |
 | `论文.zh-CN.dual.pdf` | 左右双语对照版（勾选后才输出） |
 | `论文.zh-CN.report.json` | 质检报告 |
 | `论文.zh-CN.glossary.csv` | 自动提取的术语表，可以修改后作为下次的术语表使用 |
@@ -88,6 +105,8 @@ python -m pdftrans            # 图形界面
 ```bash
 python -m pdftrans --cli 论文.pdf --api-key sk-xxx            # 源码运行
 pdftrans-cli 论文.pdf --dual --pages 1-5 -o 输出目录           # 安装包里的命令行程序
+pdftrans-cli 论文.pdf --engine microsoft                       # 免费的微软翻译
+pdftrans-cli 论文.pdf --engine google --proxy http://127.0.0.1:7890
 ```
 
 `--help` 查看全部参数；没给出的选项沿用图形界面里保存的设置。
@@ -132,7 +151,7 @@ pip install -r requirements.txt
 python -m unittest discover -v
 ```
 
-测试不调用真实接口：`tests/support/mock_llm.py` 模拟大模型接口，`tests/support/sandbox.py` 用一个
+测试不调用真实接口：`tests/support/mock_llm.py` 模拟大模型接口，`tests/support/mock_mt.py` 模拟谷歌、微软翻译，`tests/support/sandbox.py` 用一个
 基于规则的版面识别替代 BabelDOC 的神经网络模型，所以完整流程可以离线测试（BabelDOC 首次运行
 仍会下载字体）。
 
@@ -141,6 +160,7 @@ python -m unittest discover -v
 | `pdftrans/engine.py` | 调用 BabelDOC 完成一次翻译：资源准备、进度、取消、输出命名 |
 | `pdftrans/translator.py` | 接入 BabelDOC 的翻译器：翻译、校对、手动修改、记录 |
 | `pdftrans/proofread.py` | 规则检查、审校提示词与结果解析 |
+| `pdftrans/mt.py` | 谷歌翻译、微软翻译客户端（含代理设置） |
 | `pdftrans/qa.py` | 质检报告 |
 | `pdftrans/store.py` | 审校记录与手动修改的本地存储 |
 | `pdftrans/gui.py` | 图形界面（PySide6） |
@@ -149,7 +169,7 @@ python -m unittest discover -v
 
 ### 打包
 
-推送 `v` 开头的标签（如 `v0.2.0`）后，GitHub Actions 会在 Windows 和 macOS 上分别构建、
+推送 `v` 开头的标签（如 `v0.3.0`）后，GitHub Actions 会在 Windows 和 macOS 上分别构建、
 自检（`pdftrans-cli --self-test`），并把安装包发布到 Releases；也可以在 Actions 页面手动运行 `build`。
 本地打包：
 

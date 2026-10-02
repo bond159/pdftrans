@@ -12,7 +12,7 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 ROOT = Path(SPECPATH).parent
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 datas, binaries, hiddenimports = [], [], []
 for package in (

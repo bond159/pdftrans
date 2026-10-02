@@ -22,6 +22,13 @@ PRESETS = {
 # Suggestions shown in the model boxes; any model name the service accepts can be typed in.
 QWEN_MODELS = ["qwen-plus", "qwen-max", "qwen-flash", "qwen-plus-latest", "qwen-max-latest", "qwen-turbo"]
 
+# Translation engine -> label. Output files of different engines don't overwrite each other.
+ENGINES = {
+    "llm": "大模型（通义千问等）",
+    "google": "谷歌翻译（免费）",
+    "microsoft": "微软翻译 / 必应（免费）",
+}
+
 PROOFREAD_MODES = {
     "full": "规则检查 + 大模型审校（推荐）",
     "rules": "仅规则检查（不合格的段落重新翻译）",
@@ -31,6 +38,8 @@ PROOFREAD_MODES = {
 
 @dataclass
 class Settings:
+    engine: str = "llm"
+    proxy: str = ""  # for Google / Microsoft; empty means the system proxy
     preset: str = "通义千问（阿里云百炼）"
     base_url: str = DASHSCOPE_URL
     api_key: str = ""
@@ -64,6 +73,8 @@ def load_settings(path: Path = CONFIG_FILE) -> Settings:
     settings = Settings(**{k: v for k, v in data.items() if k in known})
     if settings.preset not in PRESETS:
         settings.preset = "自定义 OpenAI 兼容接口"
+    if settings.engine not in ENGINES:
+        settings.engine = "llm"
     if settings.proofread not in PROOFREAD_MODES:
         settings.proofread = "full"
     return settings
@@ -98,3 +109,16 @@ def parse_pages(spec: str, page_count: int) -> list[int]:
             raise ValueError(f"无效的页码范围: {part}")
         pages.update(range(start - 1, min(end, page_count)))
     return sorted(pages)
+
+
+def output_paths(src: str | Path, output_dir: str, engine: str) -> dict[str, Path]:
+    """Where a job writes its files. Each engine gets its own names so results can be compared."""
+    src = Path(src)
+    out = Path(output_dir) if output_dir else src.parent
+    stem = f"{src.stem}.zh-CN" + ("" if engine == "llm" else f".{engine}")
+    return {
+        "mono": out / f"{stem}.pdf",
+        "dual": out / f"{stem}.dual.pdf",
+        "report": out / f"{stem}.report.json",
+        "glossary": out / f"{stem}.glossary.csv",
+    }

@@ -53,11 +53,12 @@ class Worker(QObject):
     done = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, src: str, settings: Settings, test_only: bool = False):
+    def __init__(self, src: str, settings: Settings, test_only: bool = False, list_models: bool = False):
         super().__init__()
         self.src = src
         self.settings = settings
         self.test_only = test_only
+        self.list_models = list_models
         self.job = None
         self.cancelled = threading.Event()
 
@@ -71,6 +72,9 @@ class Worker(QObject):
         from .engine import Cancelled, Job
 
         try:
+            if self.list_models:
+                self.done.emit(fetch_models(self.settings))
+                return
             if self.test_only:
                 self.done.emit(test_connection(self.settings))
                 return
@@ -128,6 +132,24 @@ def latin_only(widget: QWidget) -> QWidget:
         w.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, False)
         w.setInputMethodHints(Qt.InputMethodHint.ImhLatinOnly | Qt.InputMethodHint.ImhNoPredictiveText)
     return widget
+
+
+def fetch_models(settings: Settings) -> list[str]:
+    """Model names offered by the configured OpenAI-compatible endpoint."""
+    import openai
+
+    client = openai.OpenAI(base_url=settings.base_url or None, api_key=settings.resolved_api_key() or "EMPTY", timeout=30)
+    try:
+        models = sorted(m.id for m in client.models.list())
+    except openai.AuthenticationError as e:
+        raise RuntimeError("API Key 无效，无法读取模型列表") from e
+    except openai.APIConnectionError as e:
+        raise RuntimeError("无法连接接口，请检查 Base URL 和网络") from e
+    except openai.APIStatusError as e:
+        raise RuntimeError(f"该接口不提供模型列表（HTTP {e.status_code}），请手动填写模型名称") from e
+    if not models:
+        raise RuntimeError("接口返回的模型列表为空，请手动填写模型名称")
+    return models
 
 
 def render_page(doc: pymupdf.Document, index: int, zoom: float) -> QPixmap:
@@ -514,7 +536,10 @@ class MainWindow(QMainWindow):
         )
         s.addRow("API Key", self._row(self.api_key, show))
         self.model = self._model_box()
-        s.addRow("翻译模型", self.model)
+        self.models_btn = QPushButton("获取模型列表")
+        self.models_btn.setToolTip("从当前接口读取可用的模型名称（不同服务、套餐的模型名称不同）")
+        self.models_btn.clicked.connect(self.fetch_models)
+        s.addRow("翻译模型", self._row(self.model, self.models_btn))
         self.review_model = self._model_box()
         s.addRow("审校模型", self.review_model)
         self.test_btn = QPushButton("测试连接")
@@ -798,8 +823,14 @@ class MainWindow(QMainWindow):
     def set_busy(self, busy: bool) -> None:
         self.start_btn.setEnabled(not busy)
         self.test_btn.setEnabled(not busy)
+        self.models_btn.setEnabled(not busy)
         self.report_view.regen_btn.setEnabled(not busy)
         self.cancel_btn.setEnabled(busy)
+
+    def fetch_models(self) -> None:
+        settings = self._collect()
+        self.status.setText("正在读取模型列表…")
+        self._run(Worker("", settings, list_models=True))
 
     def test_connection(self) -> None:
         settings = self._collect()
@@ -846,6 +877,15 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def on_done(self, result) -> None:
+        if isinstance(result, list):  # model list
+            for box in (self.model, self.review_model):
+                current = box.currentText()
+                box.clear()
+                box.addItems(result)
+                box.setCurrentText(current)
+            self.status.setText(f"已读取 {len(result)} 个模型，可在「翻译模型」「审校模型」下拉框中选择")
+            self.log.appendPlainText("可用模型：" + "、".join(result))
+            return
         if isinstance(result, str):  # connection test
             self.status.setText("连接成功")
             self.log.appendPlainText(result)

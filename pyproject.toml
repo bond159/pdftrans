@@ -1,6 +1,6 @@
 [project]
 name = "pdftrans"
-version = "0.3.0"
+version = "0.3.1"
 description = "English-to-Chinese PDF translation that keeps the layout (BabelDOC engine, automatic proofreading, desktop GUI)"
 readme = "README.md"
 license = "AGPL-3.0-or-later"

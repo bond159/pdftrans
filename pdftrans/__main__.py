@@ -4,6 +4,13 @@ import multiprocessing
 import sys
 
 
+def _child_imports() -> str:
+    # What BabelDOC's helper processes import first (font subsetting, PDF cleanup).
+    import babeldoc.format.pdf.document_il.backend.pdf_creater  # noqa: F401
+
+    return "ok"
+
+
 def self_test() -> int:
     """Import everything a translation needs; used to check frozen builds in CI."""
     import babeldoc.docvision.doclayout  # noqa: F401  (onnxruntime, opencv)
@@ -16,6 +23,12 @@ def self_test() -> int:
     from .engine import Job, bundled_assets  # noqa: F401
     from .translator import ProofreadingTranslator  # noqa: F401
 
+    # BabelDOC runs some steps in child processes and silently falls back when they
+    # crash, so check that a spawned child can import what it needs.
+    import multiprocessing
+
+    with multiprocessing.get_context("spawn").Pool(1) as pool:
+        pool.apply(_child_imports)
     print(f"pdftrans {__version__} imports OK; PyMuPDF {pymupdf.VersionBind}; bundled assets: {bundled_assets()}")
     pdfs = [a for a in sys.argv[1:] if a.lower().endswith(".pdf")]
     if pdfs:

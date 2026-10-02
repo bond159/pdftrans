@@ -66,11 +66,18 @@ class ClientTests(unittest.TestCase):
 
     def test_microsoft_refreshes_expired_token(self):
         with MockMT() as server:
-            client = mt.MicrosoftClient(url=server.microsoft_url, auth_url=server.microsoft_auth_url)
+            client = mt.MicrosoftClient(url=server.bing_url)
             self.assertEqual(client.translate(TEXT), fake_chinese(TEXT))
             server.token = "token-2"  # the old token is now rejected
             self.assertEqual(client.translate("Hello there"), fake_chinese("Hello there"))
-            self.assertEqual([r for r in server.requests if r[1] == "/translate/auth"].__len__(), 2)
+            self.assertEqual(len([r for r in server.requests if r[1] == "/translator"]), 2)
+
+    def test_microsoft_splits_to_its_size_limit(self):
+        with MockMT() as server:
+            text = " ".join(["Packets travel through routers to their destination."] * 60)
+            out = mt.MicrosoftClient(url=server.bing_url).translate(text)
+            self.assertNotIn("Packets", out)
+            self.assertGreater(len([r for r in server.requests if r[1] == "/ttranslatev3"]), 2)
 
     def test_long_text_is_split(self):
         with MockMT() as server:

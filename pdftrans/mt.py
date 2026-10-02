@@ -16,8 +16,7 @@ import urllib.request
 import httpx
 
 GOOGLE_URL = "https://translate.googleapis.com/translate_a/single"
-MICROSOFT_AUTH_URL = "https://edge.microsoft.com/translate/auth"
-MICROSOFT_URL = "https://api-edge.cognitive.microsofttranslator.com/translate"
+BING_URL = "https://www.bing.com/translator"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -131,37 +130,57 @@ class GoogleClient(Client):
 
 
 class MicrosoftClient(Client):
-    name = "微软翻译"
-    limit = 9000
+    """Microsoft Translator through the Bing Translator web page (bing.com/translator).
 
-    def __init__(self, proxy: str = "", url: str = MICROSOFT_URL, auth_url: str = MICROSOFT_AUTH_URL, **kw):
+    The page hands out a short-lived token; it is fetched once and renewed when it
+    expires or a request is refused. In mainland China bing.com redirects to
+    cn.bing.com, which works the same way.
+    """
+
+    name = "微软翻译"
+    limit = 1000  # the web endpoint accepts at most 1000 characters
+
+    def __init__(self, proxy: str = "", url: str = BING_URL, **kw):
         super().__init__(proxy, **kw)
         self.url = url
-        self.auth_url = auth_url
         self.lock = threading.Lock()
-        self.token = ""
-        self.token_time = 0.0
+        self.session: dict | None = None
+        self.session_time = 0.0
 
-    def _token(self, refresh: bool = False) -> str:
+    def _session(self, refresh: bool = False) -> dict:
         with self.lock:
-            # Tokens last ten minutes; renew a little early.
-            if refresh or not self.token or time.time() - self.token_time > 480:
-                resp = self.http.get(self.auth_url)
+            if refresh or self.session is None or time.time() - self.session_time > 600:
+                resp = self.http.get(self.url)
                 resp.raise_for_status()
-                self.token = resp.text.strip()
-                self.token_time = time.time()
-            return self.token
+                page = resp.text
+                ig = re.search(r'"ig"\s*:\s*"([^"]+)"', page, re.I) or re.search(r"IG:\s*\"([^\"]+)\"", page)
+                iid = re.findall(r'data-iid="([^"]+)"', page)
+                abuse = re.search(r"params_AbusePreventionHelper\s*=\s*\[(\d+),\s*\"([^\"]+)\"", page)
+                if not (ig and iid and abuse):
+                    raise MTError("微软翻译页面格式已变化，无法获取令牌")
+                base = str(resp.url).split("/translator")[0]  # www.bing.com or cn.bing.com
+                self.session = {
+                    "endpoint": f"{base}/ttranslatev3?isVertical=1&IG={ig.group(1)}&IID={iid[-1]}",
+                    "key": abuse.group(1),
+                    "token": abuse.group(2),
+                }
+                self.session_time = time.time()
+            return self.session
 
     def _translate(self, text: str) -> str:
         for refresh in (False, True):
+            sess = self._session(refresh)
             resp = self.http.post(
-                self.url,
-                params={"from": "en", "to": "zh-Hans", "api-version": "3.0"},
-                headers={"Authorization": f"Bearer {self._token(refresh)}"},
-                json=[{"Text": text}],
+                sess["endpoint"],
+                data={"fromLang": "en", "to": "zh-Hans", "text": text, "token": sess["token"], "key": sess["key"]},
+                headers={"Referer": self.url},
             )
-            if resp.status_code == 401 and not refresh:
-                continue  # expired token
+            if resp.status_code in (400, 401, 403) or not resp.text.strip().startswith("["):
+                if not refresh:
+                    continue  # stale token or session: get a new one and retry once
+                if resp.status_code == 429:
+                    self._check(resp)
+                raise MTError(f"微软翻译拒绝了请求（HTTP {resp.status_code}）")
             self._check(resp)
             return resp.json()[0]["translations"][0]["text"]
         raise MTError("微软翻译认证失败")
@@ -171,5 +190,5 @@ def make_client(engine: str, proxy: str = "") -> Client:
     if engine == "google":
         return GoogleClient(proxy, url=GOOGLE_URL)
     if engine == "microsoft":
-        return MicrosoftClient(proxy, url=MICROSOFT_URL, auth_url=MICROSOFT_AUTH_URL)
+        return MicrosoftClient(proxy, url=BING_URL)
     raise ValueError(f"unknown engine {engine}")

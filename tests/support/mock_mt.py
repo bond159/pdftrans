@@ -11,7 +11,7 @@ from tests.support.mock_llm import fake_chinese
 
 
 class MockMT:
-    """``with MockMT() as mt:`` then point pdftrans.mt.GOOGLE_URL etc. at ``mt.google_url`` ..."""
+    """``with MockMT() as mt:``; ``mt.patch()`` points pdftrans.mt at it."""
 
     def __init__(self):
         self.requests: list[tuple[str, str]] = []
@@ -39,8 +39,14 @@ class MockMT:
             def do_GET(self):  # noqa: N802
                 url = urlparse(self.path)
                 mock.requests.append(("GET", url.path))
-                if url.path == "/translate/auth":
-                    self._send(200, mock.token, "text/plain")
+                if url.path == "/translator":
+                    page = (
+                        '<html><script>var _G={IG:"IGVALUE"}; _G["ig":"IGVALUE"];</script>'
+                        '<div data-iid="translator.5023"></div><div data-iid="translator.5028"></div>'
+                        f'<script>var params_AbusePreventionHelper = [1700000000000,"{mock.token}",3600000];</script></html>'
+                    )
+                    page = page.replace('_G["ig":"IGVALUE"]', '{"ig":"IGVALUE"}')
+                    self._send(200, page, "text/html")
                 elif url.path == "/translate_a/single":
                     if self._throttled():
                         return
@@ -54,13 +60,21 @@ class MockMT:
             def do_POST(self):  # noqa: N802
                 url = urlparse(self.path)
                 mock.requests.append(("POST", url.path))
-                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                if self.headers.get("Authorization") != f"Bearer {mock.token}":
-                    self._send(401, "expired", "text/plain")
+                form = parse_qs(self.rfile.read(int(self.headers["Content-Length"])).decode())
+                query = parse_qs(url.query)
+                if url.path != "/ttranslatev3" or query.get("IG") != ["IGVALUE"] or query.get("IID") != ["translator.5028"]:
+                    self._send(404, "not found", "text/plain")
+                    return
+                if form.get("token") != [mock.token]:
+                    self._send(200, '{"statusCode": 205}')  # what Bing answers to a stale token
                     return
                 if self._throttled():
                     return
-                out = [{"translations": [{"text": fake_chinese(i["Text"], mock.drop_numbers), "to": "zh-Hans"}]} for i in body]
+                text = form["text"][0]
+                if len(text) > 1000:
+                    self._send(400, "too long", "text/plain")
+                    return
+                out = [{"translations": [{"text": fake_chinese(text, mock.drop_numbers), "to": "zh-Hans"}]}]
                 self._send(200, json.dumps(out, ensure_ascii=False))
 
             def log_message(self, *args):
@@ -69,18 +83,17 @@ class MockMT:
         self.server = HTTPServer(("127.0.0.1", 0), Handler)
         base = f"http://127.0.0.1:{self.server.server_port}"
         self.google_url = base + "/translate_a/single"
-        self.microsoft_auth_url = base + "/translate/auth"
-        self.microsoft_url = base + "/translate"
+        self.bing_url = base + "/translator"
 
     def patch(self):
         """Point pdftrans.mt at this server; returns a function that undoes it."""
         import pdftrans.mt as mt
 
-        old = (mt.GOOGLE_URL, mt.MICROSOFT_URL, mt.MICROSOFT_AUTH_URL)
-        mt.GOOGLE_URL, mt.MICROSOFT_URL, mt.MICROSOFT_AUTH_URL = self.google_url, self.microsoft_url, self.microsoft_auth_url
+        old = (mt.GOOGLE_URL, mt.BING_URL)
+        mt.GOOGLE_URL, mt.BING_URL = self.google_url, self.bing_url
 
         def undo():
-            mt.GOOGLE_URL, mt.MICROSOFT_URL, mt.MICROSOFT_AUTH_URL = old
+            mt.GOOGLE_URL, mt.BING_URL = old
 
         return undo
 

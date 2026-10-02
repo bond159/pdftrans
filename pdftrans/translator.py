@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 
 import openai
@@ -107,13 +108,23 @@ class Proofreader:
         return self.mode == "full" and self.client is not None
 
     def chat(self, model: str, system: str, user: str, max_tokens: int = 8192) -> str:
-        resp = self.client.chat.completions.create(
-            model=model,
-            temperature=0,
-            max_tokens=max_tokens,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            extra_body=self.extra_body,
-        )
+        delay = 2.0
+        for attempt in range(6):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=model,
+                    temperature=0,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                    extra_body=self.extra_body,
+                )
+                break
+            except (openai.RateLimitError, openai.APITimeoutError, openai.InternalServerError):
+                # Busy service: wait and retry rather than skipping the review.
+                if attempt == 5 or max_tokens <= 20:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
         self.on_usage(resp)
         return (resp.choices[0].message.content or "").strip()
 

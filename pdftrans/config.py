@@ -55,7 +55,8 @@ class Settings:
     translate_tables: bool = False  # experimental in BabelDOC
     ocr_workaround: bool = False  # for scanned PDFs with an OCR text layer
     font_family: str = "auto"  # auto / serif / sans-serif
-    qps: int = 4  # requests per second sent to the API
+    qps: int = 8  # new requests per second sent to the service
+    workers: int = 16  # requests in flight at the same time
 
     def resolved_api_key(self) -> str:
         return self.api_key or os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("PDFTRANS_API_KEY", "")

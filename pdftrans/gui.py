@@ -114,6 +114,22 @@ def test_connection(settings: Settings) -> str:
     return "\n".join(lines)
 
 
+def latin_only(widget: QWidget) -> QWidget:
+    """Let a field that only ever holds addresses, names or numbers bypass the input method.
+
+    On macOS a Chinese input method can swallow typing in some Qt fields; password
+    fields are unaffected because they never use the input method. Fields for
+    URLs, model names and proxies behave the same way with this.
+    """
+    targets = [widget]
+    if isinstance(widget, QComboBox) and widget.lineEdit() is not None:
+        targets.append(widget.lineEdit())
+    for w in targets:
+        w.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, False)
+        w.setInputMethodHints(Qt.InputMethodHint.ImhLatinOnly | Qt.InputMethodHint.ImhNoPredictiveText)
+    return widget
+
+
 def render_page(doc: pymupdf.Document, index: int, zoom: float) -> QPixmap:
     pix = doc[index].get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
     img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
@@ -467,7 +483,7 @@ class MainWindow(QMainWindow):
             self.engine.addItem(label, key)
         self.engine.currentIndexChanged.connect(lambda _: self._update_engine_fields())
         e.addRow("引擎", self.engine)
-        self.proxy = QLineEdit()
+        self.proxy = latin_only(QLineEdit())
         self.proxy.setPlaceholderText("留空则使用系统代理，例如 http://127.0.0.1:7890")
         self.proxy_label = QLabel("网络代理")
         e.addRow(self.proxy_label, self.proxy)
@@ -483,15 +499,18 @@ class MainWindow(QMainWindow):
         self.preset.addItems(PRESETS.keys())
         self.preset.currentTextChanged.connect(self.on_preset)
         s.addRow("服务", self.preset)
-        self.base_url = QLineEdit()
+        self.base_url = latin_only(QLineEdit())
         self.base_url.setClearButtonEnabled(True)
         s.addRow("Base URL", self.base_url)
-        self.api_key = QLineEdit()
+        self.api_key = latin_only(QLineEdit())
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key.setPlaceholderText("sk-…（也可用环境变量 DASHSCOPE_API_KEY）")
         show = QCheckBox("显示")
         show.toggled.connect(
-            lambda on: self.api_key.setEchoMode(QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password)
+            lambda on: (
+                self.api_key.setEchoMode(QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password),
+                latin_only(self.api_key),  # setEchoMode turns the input method back on
+            )
         )
         s.addRow("API Key", self._row(self.api_key, show))
         self.model = self._model_box()
@@ -511,9 +530,17 @@ class MainWindow(QMainWindow):
         o.addRow("自动校对", self.proofread)
         self.dual = QCheckBox("同时输出左右双语对照版")
         o.addRow("输出", self.dual)
-        self.pages = QLineEdit()
-        self.pages.setPlaceholderText("全部；或如 1-5,8")
-        o.addRow("页码范围", self.pages)
+        # Number boxes rather than free text: they take digits directly, whatever input method is active.
+        self.all_pages = QCheckBox("全部")
+        self.all_pages.setChecked(True)
+        self.page_from = QSpinBox()
+        self.page_to = QSpinBox()
+        for box in (self.page_from, self.page_to):
+            box.setRange(1, 1)
+            box.setEnabled(False)
+        self.all_pages.toggled.connect(lambda on: [b.setEnabled(not on) for b in (self.page_from, self.page_to)])
+        self.page_from.valueChanged.connect(lambda v: self.page_to.setMinimum(v))
+        o.addRow("页码范围", self._row(self.all_pages, QLabel("第"), self.page_from, QLabel("页 至 第"), self.page_to, QLabel("页")))
         self.glossary = QLineEdit()
         self.glossary.setPlaceholderText("可选：CSV 文件，两列 source,target")
         pick_glossary = QPushButton("…")
@@ -533,9 +560,14 @@ class MainWindow(QMainWindow):
         for key, label in FONT_FAMILIES.items():
             self.font_family.addItem(label, key)
         a.addRow("中文字体", self.font_family)
+        self.workers = QSpinBox()
+        self.workers.setRange(1, 64)
+        self.workers.setToolTip("同时发出的翻译请求数。越大越快，太大可能被服务限流（会自动重试）。")
+        a.addRow("同时请求数", self.workers)
         self.qps = QSpinBox()
         self.qps.setRange(1, 50)
         self.qps.setSuffix(" 次/秒")
+        self.qps.setToolTip("每秒最多发出的新请求数。")
         a.addRow("请求速率上限", self.qps)
         self.tables = QCheckBox("翻译表格内的文字（实验性）")
         a.addRow(self.tables)
@@ -576,7 +608,7 @@ class MainWindow(QMainWindow):
         box = QComboBox()
         box.setEditable(True)
         box.addItems(QWEN_MODELS)
-        return box
+        return latin_only(box)
 
     @staticmethod
     def _row(*widgets: QWidget) -> QWidget:
@@ -605,12 +637,12 @@ class MainWindow(QMainWindow):
         self._select(self.proofread, st.proofread)
         self._update_engine_fields()
         self.dual.setChecked(st.dual)
-        self.pages.setText(st.pages)
         self.glossary.setText(st.glossary_file)
         self.auto_glossary.setChecked(st.auto_glossary)
         self.extra.setPlainText(st.extra_prompt)
         self._select(self.font_family, st.font_family)
         self.qps.setValue(st.qps)
+        self.workers.setValue(st.workers)
         self.tables.setChecked(st.translate_tables)
         self.ocr.setChecked(st.ocr_workaround)
         self.out_edit.setText(st.output_dir)
@@ -624,12 +656,13 @@ class MainWindow(QMainWindow):
         st.review_model = self.review_model.currentText().strip()
         st.proofread = self.proofread.currentData()
         st.dual = self.dual.isChecked()
-        st.pages = self.pages.text().strip()
+        st.pages = self._page_spec()
         st.glossary_file = self.glossary.text().strip()
         st.auto_glossary = self.auto_glossary.isChecked()
         st.extra_prompt = self.extra.toPlainText()
         st.font_family = self.font_family.currentData()
         st.qps = self.qps.value()
+        st.workers = self.workers.value()
         st.translate_tables = self.tables.isChecked()
         st.ocr_workaround = self.ocr.isChecked()
         st.output_dir = self.out_edit.text().strip()
@@ -687,6 +720,7 @@ class MainWindow(QMainWindow):
             return
         self.src = path
         self.file_edit.setText(path)
+        self._reset_pages(self.preview.original.page_count)
         self.result = None
         self.open_btn.setEnabled(False)
         self.open_dir_btn.setEnabled(False)
@@ -708,6 +742,19 @@ class MainWindow(QMainWindow):
         if found:
             self.status.setText(self.status.text() + "，已载入上次的结果：" + "、".join(found))
 
+    def _page_spec(self) -> str:
+        if self.all_pages.isChecked() or self.preview.original is None:
+            return ""
+        return f"{self.page_from.value()}-{self.page_to.value()}"
+
+    def _reset_pages(self, count: int) -> None:
+        self.all_pages.setChecked(True)
+        for box in (self.page_from, self.page_to):
+            box.setMinimum(1)
+            box.setMaximum(count)
+        self.page_from.setValue(1)
+        self.page_to.setValue(count)
+
     def _pages_of(self, translated: Path) -> list[int]:
         """Original pages contained in a translated PDF, in order."""
         total = self.preview.original.page_count
@@ -718,7 +765,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
-            return parse_pages(self.pages.text(), total)
+            return parse_pages(self._page_spec(), total)
         except ValueError:
             return list(range(total))
 

@@ -183,6 +183,7 @@ class Job:
             no_dual=not st.dual,
             no_mono=False,
             qps=max(1, st.qps),
+            pool_max_workers=max(1, st.workers),
             use_rich_pbar=False,
             report_interval=0.3,
             watermark_output_mode=WatermarkOutputMode.NoWatermark,
@@ -223,15 +224,27 @@ class Job:
             tokens=translator.token_count.value,
         )
 
+    def _eta(self, stage: str, current: int, total: int) -> str:
+        """Remaining time for the translation stage, from its pace so far."""
+        now = time.time()
+        start = self._stage_start.setdefault(stage, (now, current))
+        elapsed, done = now - start[0], current - start[1]
+        if stage != "Translate Paragraphs" or done <= 0 or elapsed < 10 or current >= total:
+            return ""
+        minutes = elapsed / done * (total - current) / 60
+        return f"，预计还需 {minutes:.0f} 分钟" if minutes >= 1 else "，预计不到 1 分钟"
+
     async def _translate(self, high_level):
         result = None
+        self._stage_start: dict[str, tuple[float, int]] = {}
         async for event in high_level.async_translate(self.config):
             kind = event["type"]
             if kind in ("progress_start", "progress_update", "progress_end"):
                 stage = STAGE_NAMES.get(event["stage"], event["stage"])
                 detail = ""
                 if event.get("stage_total"):
-                    detail = f"（{event.get('stage_current', 0)}/{event['stage_total']}）"
+                    current, total = event.get("stage_current", 0), event["stage_total"]
+                    detail = f"（{current}/{total}{self._eta(event['stage'], current, total)}）"
                 self.progress(float(event.get("overall_progress", 0.0)), f"{stage}{detail}")
             elif kind == "error":
                 if self._cancelled.is_set():

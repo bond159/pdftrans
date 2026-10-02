@@ -56,5 +56,6 @@ if sys.platform == "darwin":
             "CFBundleDisplayName": "PDF英译中",
             "CFBundleShortVersionString": VERSION,
             "NSHighResolutionCapable": True,
+            "NSPrincipalClass": "NSApplication",
         },
     )

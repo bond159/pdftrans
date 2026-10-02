@@ -184,6 +184,9 @@ class Job:
             no_mono=False,
             qps=max(1, st.qps),
             pool_max_workers=max(1, st.workers),
+            # BabelDOC skips text shorter than 5 characters by default, which leaves short
+            # figure labels such as "Host" or "node" in English next to translated ones.
+            min_text_length=3,
             use_rich_pbar=False,
             report_interval=0.3,
             watermark_output_mode=WatermarkOutputMode.NoWatermark,

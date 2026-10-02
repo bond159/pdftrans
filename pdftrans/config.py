@@ -59,7 +59,8 @@ class Settings:
     workers: int = 16  # requests in flight at the same time
 
     def resolved_api_key(self) -> str:
-        return self.api_key or os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("PDFTRANS_API_KEY", "")
+        key = self.api_key or os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("PDFTRANS_API_KEY", "")
+        return key.strip()  # pasted keys often carry a trailing newline or space
 
     def resolved_review_model(self) -> str:
         return self.review_model or self.model

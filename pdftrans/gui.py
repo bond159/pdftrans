@@ -1,4 +1,4 @@
-"""Desktop GUI (PySide6) for translating PDFs."""
+"""Desktop GUI (PySide6)."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import pymupdf
 from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices, QImage, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -28,27 +30,26 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from . import __version__
-from .config import LANGUAGES, PRESETS, Settings, load_settings, parse_pages, save_settings
-from .llm import TranslationCache, Translator, make_backend
-from .pipeline import Cancelled, JobResult, translate_pdf
+from .config import PRESETS, PROOFREAD_MODES, QWEN_MODELS, Settings, load_settings, parse_pages, save_settings
+from .qa import KINDS, Item, Report
+from .store import Store
 
-MODE_LABELS = {
-    "mono": "仅译文（保留原排版）",
-    "dual": "双语对照（左原文 · 右译文）",
-    "alt": "双语交替（原文页 + 译文页）",
-}
 ZOOMS = ["适合宽度", "50%", "75%", "100%", "125%", "150%", "200%"]
+FONT_FAMILIES = {"auto": "自动（跟随原文）", "serif": "宋体风格（衬线）", "sans-serif": "黑体风格（无衬线）"}
 
 
 class Worker(QObject):
-    """Runs one translation job off the GUI thread."""
+    """Runs a translation job, or a connection test, off the GUI thread."""
 
-    progress = Signal(int, int, str)
+    progress = Signal(float, str)
     done = Signal(object)
     failed = Signal(str)
 
@@ -57,23 +58,50 @@ class Worker(QObject):
         self.src = src
         self.settings = settings
         self.test_only = test_only
-        self.cancel = threading.Event()
+        self.job = None
+        self.cancelled = threading.Event()
+
+    def cancel(self) -> None:
+        self.cancelled.set()
+        if self.job is not None:
+            self.job.cancel()
 
     @Slot()
     def run(self) -> None:
+        from .engine import Cancelled, Job
+
         try:
-            backend = make_backend(self.settings)
-            cache = TranslationCache() if self.settings.use_cache else None
-            translator = Translator(backend, self.settings, cache)
             if self.test_only:
-                self.done.emit(translator.test())
+                self.done.emit(test_connection(self.settings))
                 return
-            result = translate_pdf(self.src, self.settings, translator, self.progress.emit, self.cancel)
-            self.done.emit(result)
+            self.job = Job(self.src, self.settings, self.progress.emit)
+            if self.cancelled.is_set():
+                self.job.cancel()
+            self.done.emit(self.job.run())
         except Cancelled:
             self.failed.emit("已取消")
-        except Exception as e:  # surface every failure in the GUI instead of crashing
+        except Exception as e:  # show every failure in the window instead of crashing
             self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+def test_connection(settings: Settings) -> str:
+    import openai
+
+    client = openai.OpenAI(base_url=settings.base_url or None, api_key=settings.resolved_api_key() or "EMPTY", timeout=60)
+    extra = {"enable_thinking": False} if "dashscope" in settings.base_url or settings.model.startswith("qwen") else {}
+    lines = []
+    models = [("翻译模型", settings.model)]
+    if settings.proofread == "full" and settings.resolved_review_model() != settings.model:
+        models.append(("审校模型", settings.resolved_review_model()))
+    for role, model in models:
+        reply = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "把这句话翻译成中文，只输出译文：Attention is all you need."}],
+            max_tokens=100,
+            extra_body=extra,
+        )
+        lines.append(f"{role} {model}：{(reply.choices[0].message.content or '').strip()}")
+    return "\n".join(lines)
 
 
 def render_page(doc: pymupdf.Document, index: int, zoom: float) -> QPixmap:
@@ -113,7 +141,7 @@ class Preview(QWidget):
         self.right = QLabel()
         for label in (self.left, self.right):
             label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
-            label.setStyleSheet("background: #ffffff; border: 1px solid #c8c8c8;")
+            label.setStyleSheet("background: #ffffff; border: 1px solid #c8c8c8; color: #666;")
         pages = QWidget()
         row = QHBoxLayout(pages)
         row.addWidget(self.left)
@@ -121,7 +149,6 @@ class Preview(QWidget):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setWidget(pages)
-        self.scroll.setStyleSheet("QScrollArea { background: #e9e9ec; }")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -133,11 +160,8 @@ class Preview(QWidget):
         self.page_spin.valueChanged.connect(lambda v: self.go(v - 1))
         self.zoom.currentIndexChanged.connect(lambda _: self.refresh())
         self.show_original.toggled.connect(lambda _: self.refresh())
-        self.clear()
-
-    def clear(self) -> None:
-        self.left.setText("拖入或选择一个 PDF 文件")
-        self.right.setText("翻译完成后在这里显示译文")
+        self.left.setText("把英文 PDF 拖到窗口里，或点「选择 PDF…」")
+        self.right.setText("翻译完成后在这里显示中文版")
 
     def set_original(self, path: str) -> None:
         self.original = pymupdf.open(path)
@@ -151,8 +175,15 @@ class Preview(QWidget):
 
     def set_translated(self, path: Path, pages: list[int]) -> None:
         self.translated = pymupdf.open(path)
-        self.page_map = {p: i for i, p in enumerate(pages)}
-        self.go(pages[0] if self.page not in self.page_map else self.page)
+        self.page_map = {p: i for i, p in enumerate(pages) if i < self.translated.page_count}
+        self.go(self.page if self.page in self.page_map else pages[0])
+
+    def go_translated(self, translated_page: int) -> None:
+        """Show the page whose translation is page translated_page (0-based)."""
+        for original, translated in self.page_map.items():
+            if translated == translated_page:
+                self.go(original)
+                return
 
     def go(self, page: int) -> None:
         if self.original is None:
@@ -163,28 +194,26 @@ class Preview(QWidget):
         self.page_spin.blockSignals(False)
         self.refresh()
 
-    def _zoom_for(self, doc: pymupdf.Document, index: int, panes: int) -> float:
+    def _zoom(self, panes: int) -> float:
         choice = self.zoom.currentText()
         if choice.endswith("%"):
             return int(choice[:-1]) / 100
         width = self.scroll.viewport().width() / panes - 30
-        return max(0.2, width / doc[index].rect.width)
+        return max(0.2, width / self.original[self.page].rect.width)
 
     def refresh(self) -> None:
         if self.original is None:
             return
         both = self.show_original.isChecked() or self.translated is None
         self.left.setVisible(both)
-        panes = 2 if both else 1
-        zoom = self._zoom_for(self.original, self.page, panes)
+        zoom = self._zoom(2 if both else 1)
         if both:
             self.left.setPixmap(render_page(self.original, self.page, zoom))
         if self.translated is not None and self.page in self.page_map:
             self.right.setPixmap(render_page(self.translated, self.page_map[self.page], zoom))
-        elif self.translated is not None:
-            self.right.setText("此页不在翻译范围内")
         else:
-            self.right.setText("翻译完成后在这里显示译文")
+            self.right.setPixmap(QPixmap())
+            self.right.setText("此页不在翻译范围内" if self.translated is not None else "翻译完成后在这里显示中文版")
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         super().resizeEvent(event)
@@ -192,31 +221,176 @@ class Preview(QWidget):
             self.refresh()
 
 
+class ReportView(QWidget):
+    """Quality report: paragraphs to look at, with an editor for manual corrections."""
+
+    jump = Signal(int)  # 1-based page in the Chinese PDF
+    regenerate = Signal()
+
+    def __init__(self, store_factory):
+        super().__init__()
+        self.store_factory = store_factory
+        self.items: list[Item] = []
+        self.summary = QLabel("翻译完成后，这里列出自动校对修正过的段落和仍需人工检查的地方。")
+        self.summary.setWordWrap(True)
+        self.filter = QComboBox()
+        self.filter.addItem("全部", "")
+        for kind, label in KINDS.items():
+            self.filter.addItem(label, kind)
+        self.filter.currentIndexChanged.connect(lambda _: self._fill())
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["类型", "页", "说明 / 译文"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.itemSelectionChanged.connect(self._show_selected)
+        self.table.cellDoubleClicked.connect(self._jump_selected)
+
+        self.source = QPlainTextEdit()
+        self.source.setReadOnly(True)
+        self.translation = QPlainTextEdit()
+        self.notes = QLabel()
+        self.notes.setWordWrap(True)
+        self.notes.setTextFormat(Qt.TextFormat.PlainText)
+        self.save_btn = QPushButton("保存我的修改")
+        self.revert_btn = QPushButton("取消手动修改")
+        self.regen_btn = QPushButton("重新生成 PDF")
+        self.save_btn.clicked.connect(self._save)
+        self.revert_btn.clicked.connect(self._revert)
+        self.regen_btn.clicked.connect(self.regenerate.emit)
+
+        detail = QWidget()
+        d = QFormLayout(detail)
+        d.addRow("原文", self.source)
+        d.addRow("译文", self.translation)
+        d.addRow("", self.notes)
+        hint = QLabel(
+            "{v1} 是公式占位符，<style id='1'>…</style> 是格式标记，修改译文时请原样保留。"
+            "保存后点「重新生成 PDF」：其余段落直接用缓存，不会重复计费。"
+        )
+        hint.setWordWrap(True)
+        hint.setTextFormat(Qt.TextFormat.PlainText)
+        hint.setStyleSheet("color: #777;")
+        d.addRow("", hint)
+        buttons = QHBoxLayout()
+        for b in (self.save_btn, self.revert_btn, self.regen_btn):
+            buttons.addWidget(b)
+        d.addRow(buttons)
+
+        top = QHBoxLayout()
+        top.addWidget(self.summary, 1)
+        top.addWidget(QLabel("显示"))
+        top.addWidget(self.filter)
+        split = QSplitter(Qt.Orientation.Vertical)
+        split.addWidget(self.table)
+        split.addWidget(detail)
+        split.setSizes([320, 320])
+        layout = QVBoxLayout(self)
+        layout.addLayout(top)
+        layout.addWidget(split, 1)
+        self._enable(False)
+
+    def _enable(self, on: bool) -> None:
+        for w in (self.translation, self.save_btn, self.revert_btn):
+            w.setEnabled(on)
+
+    def set_report(self, report: Report) -> None:
+        self.items = report.items
+        self.summary.setText(report.summary() + "。双击一行可在预览中跳到对应页面。")
+        self._fill()
+
+    def _visible(self) -> list[Item]:
+        kind = self.filter.currentData()
+        return [i for i in self.items if not kind or i.kind == kind]
+
+    def _fill(self) -> None:
+        rows = self._visible()
+        self.table.setRowCount(len(rows))
+        for r, item in enumerate(rows):
+            text = "；".join(item.notes) + "  —  " + (item.translation or item.source)[:80]
+            for c, value in enumerate([KINDS[item.kind], str(item.page or "?"), text]):
+                self.table.setItem(r, c, QTableWidgetItem(value))
+        self.table.resizeColumnsToContents()
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+
+    def _selected(self) -> Item | None:
+        rows = self.table.selectionModel().selectedRows()
+        visible = self._visible()
+        return visible[rows[0].row()] if rows and rows[0].row() < len(visible) else None
+
+    def _show_selected(self) -> None:
+        item = self._selected()
+        if item is None:
+            return
+        self.source.setPlainText(item.source)
+        self.translation.setPlainText(item.translation)
+        notes = "；".join(item.notes)
+        if item.draft and item.draft != item.translation:
+            notes += f"\n审校前的译文：{item.draft}"
+        self.notes.setText(notes)
+        self._enable(item.kind != "english")
+
+    def _jump_selected(self, *_):
+        item = self._selected()
+        if item and item.page:
+            self.jump.emit(item.page)
+
+    def _save(self) -> None:
+        item = self._selected()
+        text = self.translation.toPlainText().strip()
+        if item is None or not text:
+            return
+        self.store_factory().set_override(item.source, text)
+        item.translation = text
+        item.kind = "manual"
+        item.notes = ["使用你手动修改的译文（重新生成 PDF 后生效）"]
+        self._fill()
+
+    def _revert(self) -> None:
+        item = self._selected()
+        if item is not None:
+            self.store_factory().remove_override(item.source)
+            self.notes.setText("已取消手动修改，重新生成 PDF 后恢复自动译文。")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"PDF 翻译器 pdftrans {__version__}")
-        self.resize(1400, 900)
+        self.setWindowTitle(f"PDF 英译中 pdftrans {__version__}")
+        self.resize(1440, 920)
         self.setAcceptDrops(True)
         self.settings = load_settings()
         self.src = ""
         self.job_thread: QThread | None = None
         self.worker: Worker | None = None
-        self.result: JobResult | None = None
+        self.result = None
+        self._store: Store | None = None
 
         self.preview = Preview()
-        panel = self._build_panel()
+        self.report_view = ReportView(self.store)
+        self.report_view.jump.connect(self.jump_to_page)
+        self.report_view.regenerate.connect(self.start)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.preview, "预览")
+        self.tabs.addTab(self.report_view, "质检报告")
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setWidget(panel)
-        scroll.setMinimumWidth(380)
+        scroll.setWidget(self._build_panel())
+        scroll.setMinimumWidth(400)
         splitter = QSplitter()
         splitter.addWidget(scroll)
-        splitter.addWidget(self.preview)
+        splitter.addWidget(self.tabs)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([420, 980])
+        splitter.setSizes([430, 1010])
         self.setCentralWidget(splitter)
         self._load_into_form()
+
+    def store(self) -> Store:
+        if self._store is None:
+            self._store = Store()
+        return self._store
 
     # ----- form -------------------------------------------------------------
     def _build_panel(self) -> QWidget:
@@ -227,40 +401,37 @@ class MainWindow(QMainWindow):
         f = QFormLayout(files)
         self.file_edit = QLineEdit()
         self.file_edit.setReadOnly(True)
-        self.file_edit.setPlaceholderText("把 PDF 拖到窗口中，或点击右侧按钮")
+        self.file_edit.setPlaceholderText("把英文 PDF 拖到窗口中")
         pick = QPushButton("选择 PDF…")
         pick.clicked.connect(self.choose_file)
         f.addRow(self._row(self.file_edit, pick))
         self.out_edit = QLineEdit()
         self.out_edit.setPlaceholderText("默认与原文件相同的文件夹")
         pick_out = QPushButton("浏览…")
-        pick_out.clicked.connect(self.choose_output_dir)
+        pick_out.clicked.connect(lambda: self._pick_dir(self.out_edit))
         f.addRow("输出到", self._row(self.out_edit, pick_out))
         layout.addWidget(files)
 
-        service = QGroupBox("翻译服务（大模型 API）")
+        service = QGroupBox("大模型服务")
         s = QFormLayout(service)
         self.preset = QComboBox()
         self.preset.addItems(PRESETS.keys())
         self.preset.currentTextChanged.connect(self.on_preset)
-        s.addRow("服务商", self.preset)
+        s.addRow("服务", self.preset)
         self.base_url = QLineEdit()
-        self.base_url.setPlaceholderText("https://…/v1")
         s.addRow("Base URL", self.base_url)
         self.api_key = QLineEdit()
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key.setPlaceholderText("sk-…（也可用环境变量）")
+        self.api_key.setPlaceholderText("sk-…（也可用环境变量 DASHSCOPE_API_KEY）")
         show = QCheckBox("显示")
         show.toggled.connect(
             lambda on: self.api_key.setEchoMode(QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password)
         )
         s.addRow("API Key", self._row(self.api_key, show))
-        self.model = QLineEdit()
-        s.addRow("模型", self.model)
-        self.effort = QComboBox()
-        self.effort.addItems(["low", "medium", "high"])
-        self.effort_label = QLabel("推理强度")
-        s.addRow(self.effort_label, self.effort)
+        self.model = self._model_box()
+        s.addRow("翻译模型", self.model)
+        self.review_model = self._model_box()
+        s.addRow("审校模型", self.review_model)
         self.test_btn = QPushButton("测试连接")
         self.test_btn.clicked.connect(self.test_connection)
         s.addRow(self.test_btn)
@@ -268,40 +439,43 @@ class MainWindow(QMainWindow):
 
         opts = QGroupBox("翻译选项")
         o = QFormLayout(opts)
-        self.lang = QComboBox()
-        for code, (name, _) in LANGUAGES.items():
-            self.lang.addItem(name, code)
-        o.addRow("目标语言", self.lang)
+        self.proofread = QComboBox()
+        for key, label in PROOFREAD_MODES.items():
+            self.proofread.addItem(label, key)
+        o.addRow("自动校对", self.proofread)
+        self.dual = QCheckBox("同时输出左右双语对照版")
+        o.addRow("输出", self.dual)
         self.pages = QLineEdit()
         self.pages.setPlaceholderText("全部；或如 1-5,8")
         o.addRow("页码范围", self.pages)
-        self.mode_boxes = {m: QCheckBox(label) for m, label in MODE_LABELS.items()}
-        modes = QWidget()
-        mv = QVBoxLayout(modes)
-        mv.setContentsMargins(0, 0, 0, 0)
-        for box in self.mode_boxes.values():
-            mv.addWidget(box)
-        o.addRow("输出", modes)
-        self.concurrency = QSpinBox()
-        self.concurrency.setRange(1, 32)
-        o.addRow("并发请求数", self.concurrency)
-        self.batch_chars = QSpinBox()
-        self.batch_chars.setRange(200, 20000)
-        self.batch_chars.setSingleStep(500)
-        self.batch_chars.setSuffix(" 字符")
-        o.addRow("每批文本量", self.batch_chars)
-        self.font_edit = QLineEdit()
-        self.font_edit.setPlaceholderText("可选：译文字体 .ttf/.otf")
-        pick_font = QPushButton("…")
-        pick_font.clicked.connect(self.choose_font)
-        o.addRow("字体", self._row(self.font_edit, pick_font))
-        self.use_cache = QCheckBox("缓存译文（重复翻译不再计费）")
-        o.addRow(self.use_cache)
+        self.glossary = QLineEdit()
+        self.glossary.setPlaceholderText("可选：CSV 文件，两列 source,target")
+        pick_glossary = QPushButton("…")
+        pick_glossary.clicked.connect(self.choose_glossary)
+        o.addRow("术语表", self._row(self.glossary, pick_glossary))
+        self.auto_glossary = QCheckBox("自动提取全文术语，保证译法一致")
+        o.addRow(self.auto_glossary)
         self.extra = QPlainTextEdit()
-        self.extra.setPlaceholderText("可选：术语表或风格要求，例如\nattention → 注意力\nLLM → 大语言模型\n译文风格：学术、简洁")
-        self.extra.setFixedHeight(90)
+        self.extra.setPlaceholderText("可选：学科领域或风格要求，例如\n这是一篇医学影像论文\nattention 译为“注意力”")
+        self.extra.setFixedHeight(80)
         o.addRow("附加要求", self.extra)
         layout.addWidget(opts)
+
+        adv = QGroupBox("高级")
+        a = QFormLayout(adv)
+        self.font_family = QComboBox()
+        for key, label in FONT_FAMILIES.items():
+            self.font_family.addItem(label, key)
+        a.addRow("中文字体", self.font_family)
+        self.qps = QSpinBox()
+        self.qps.setRange(1, 50)
+        self.qps.setSuffix(" 次/秒")
+        a.addRow("请求速率上限", self.qps)
+        self.tables = QCheckBox("翻译表格内的文字（实验性）")
+        a.addRow(self.tables)
+        self.ocr = QCheckBox("扫描版 PDF 兼容模式（已有 OCR 文字层时）")
+        a.addRow(self.ocr)
+        layout.addWidget(adv)
 
         self.start_btn = QPushButton("开始翻译")
         self.start_btn.setStyleSheet("font-weight: bold; padding: 8px;")
@@ -311,25 +485,32 @@ class MainWindow(QMainWindow):
         self.cancel_btn.clicked.connect(self.cancel)
         layout.addWidget(self._row(self.start_btn, self.cancel_btn))
         self.progress = QProgressBar()
-        self.progress.setRange(0, 1)
+        self.progress.setRange(0, 1000)
         self.progress.setValue(0)
         layout.addWidget(self.progress)
         self.status = QLabel("就绪")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
-        self.open_dual_btn = QPushButton("打开结果 PDF")
-        self.open_dual_btn.setEnabled(False)
-        self.open_dual_btn.clicked.connect(self.open_result)
+        self.open_btn = QPushButton("打开中文 PDF")
+        self.open_btn.setEnabled(False)
+        self.open_btn.clicked.connect(self.open_result)
         self.open_dir_btn = QPushButton("打开输出文件夹")
         self.open_dir_btn.setEnabled(False)
         self.open_dir_btn.clicked.connect(self.open_output_dir)
-        layout.addWidget(self._row(self.open_dual_btn, self.open_dir_btn))
+        layout.addWidget(self._row(self.open_btn, self.open_dir_btn))
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(500)
-        self.log.setMinimumHeight(100)
+        self.log.setMinimumHeight(90)
         layout.addWidget(self.log, 1)
         return panel
+
+    @staticmethod
+    def _model_box() -> QComboBox:
+        box = QComboBox()
+        box.setEditable(True)
+        box.addItems(QWEN_MODELS)
+        return box
 
     @staticmethod
     def _row(*widgets: QWidget) -> QWidget:
@@ -340,67 +521,56 @@ class MainWindow(QMainWindow):
             h.addWidget(x, 1 if i == 0 else 0)
         return w
 
+    @staticmethod
+    def _select(box: QComboBox, data: str) -> None:
+        box.setCurrentIndex(max(0, box.findData(data)))
+
     def _load_into_form(self) -> None:
         st = self.settings
         self.preset.blockSignals(True)
-        if st.preset in PRESETS:
-            self.preset.setCurrentText(st.preset)
+        self.preset.setCurrentText(st.preset)
         self.preset.blockSignals(False)
-        self._current_preset = self.preset.currentText()
         self.base_url.setText(st.base_url)
         self.api_key.setText(st.api_key)
-        self.model.setText(st.model)
-        self.effort.setCurrentText(st.effort)
-        self._update_provider_fields()
-        idx = self.lang.findData(st.target_lang)
-        self.lang.setCurrentIndex(max(0, idx))
+        self.model.setCurrentText(st.model)
+        self.review_model.setCurrentText(st.review_model)
+        self._select(self.proofread, st.proofread)
+        self.dual.setChecked(st.dual)
         self.pages.setText(st.pages)
-        for m, box in self.mode_boxes.items():
-            box.setChecked(m in st.modes)
-        self.concurrency.setValue(st.concurrency)
-        self.batch_chars.setValue(st.batch_chars)
-        self.font_edit.setText(st.font_file)
-        self.use_cache.setChecked(st.use_cache)
+        self.glossary.setText(st.glossary_file)
+        self.auto_glossary.setChecked(st.auto_glossary)
         self.extra.setPlainText(st.extra_prompt)
+        self._select(self.font_family, st.font_family)
+        self.qps.setValue(st.qps)
+        self.tables.setChecked(st.translate_tables)
+        self.ocr.setChecked(st.ocr_workaround)
         self.out_edit.setText(st.output_dir)
 
     def _collect(self) -> Settings:
         st = self.settings
         st.preset = self.preset.currentText()
-        st.provider = PRESETS[st.preset][0]
         st.base_url = self.base_url.text().strip()
         st.api_key = self.api_key.text().strip()
-        st.saved_keys[st.preset] = st.api_key
-        st.model = self.model.text().strip()
-        st.effort = self.effort.currentText()
-        st.target_lang = self.lang.currentData()
+        st.model = self.model.currentText().strip()
+        st.review_model = self.review_model.currentText().strip()
+        st.proofread = self.proofread.currentData()
+        st.dual = self.dual.isChecked()
         st.pages = self.pages.text().strip()
-        st.modes = [m for m, box in self.mode_boxes.items() if box.isChecked()]
-        st.concurrency = self.concurrency.value()
-        st.batch_chars = self.batch_chars.value()
-        st.font_file = self.font_edit.text().strip()
-        st.use_cache = self.use_cache.isChecked()
+        st.glossary_file = self.glossary.text().strip()
+        st.auto_glossary = self.auto_glossary.isChecked()
         st.extra_prompt = self.extra.toPlainText()
+        st.font_family = self.font_family.currentData()
+        st.qps = self.qps.value()
+        st.translate_tables = self.tables.isChecked()
+        st.ocr_workaround = self.ocr.isChecked()
         st.output_dir = self.out_edit.text().strip()
         save_settings(st)
         return st
 
-    def _update_provider_fields(self) -> None:
-        is_claude = PRESETS[self.preset.currentText()][0] == "anthropic"
-        self.effort.setVisible(is_claude)
-        self.effort_label.setVisible(is_claude)
-        self.base_url.setPlaceholderText("留空使用官方接口" if is_claude else "https://…/v1")
-
     @Slot(str)
     def on_preset(self, name: str) -> None:
-        # Remember the key typed for the previous service, restore the one for this service.
-        self.settings.saved_keys[self._current_preset] = self.api_key.text().strip()
-        self._current_preset = name
-        _, url, model = PRESETS[name]
-        self.base_url.setText(url)
-        self.model.setText(model)
-        self.api_key.setText(self.settings.saved_keys.get(name, ""))
-        self._update_provider_fields()
+        if PRESETS[name]:
+            self.base_url.setText(PRESETS[name])
 
     # ----- files ------------------------------------------------------------
     def choose_file(self) -> None:
@@ -408,15 +578,15 @@ class MainWindow(QMainWindow):
         if path:
             self.load_file(path)
 
-    def choose_output_dir(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "选择输出文件夹")
+    def choose_glossary(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "选择术语表", "", "CSV 文件 (*.csv)")
         if path:
-            self.out_edit.setText(path)
+            self.glossary.setText(path)
 
-    def choose_font(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "选择字体", "", "字体 (*.ttf *.otf *.ttc)")
+    def _pick_dir(self, edit: QLineEdit) -> None:
+        path = QFileDialog.getExistingDirectory(self, "选择文件夹")
         if path:
-            self.font_edit.setText(path)
+            edit.setText(path)
 
     def load_file(self, path: str) -> None:
         try:
@@ -427,9 +597,28 @@ class MainWindow(QMainWindow):
         self.src = path
         self.file_edit.setText(path)
         self.result = None
-        self.open_dual_btn.setEnabled(False)
+        self.open_btn.setEnabled(False)
         self.open_dir_btn.setEnabled(False)
+        self.tabs.setCurrentWidget(self.preview)
         self.status.setText(f"已载入：{Path(path).name}（{self.preview.original.page_count} 页）")
+        # Show an earlier result for this file if there is one.
+        out_dir = Path(self.out_edit.text().strip() or Path(path).parent)
+        mono = out_dir / f"{Path(path).stem}.zh-CN.pdf"
+        report = out_dir / f"{Path(path).stem}.zh-CN.report.json"
+        if mono.exists():
+            self.preview.set_translated(mono, self._pages())
+            if report.exists():
+                try:
+                    self.report_view.set_report(Report.load(report))
+                except (OSError, ValueError, TypeError, KeyError):
+                    pass
+            self.status.setText(self.status.text() + "，已显示上次的翻译结果")
+
+    def _pages(self) -> list[int]:
+        try:
+            return parse_pages(self.pages.text(), self.preview.original.page_count)
+        except ValueError:
+            return list(range(self.preview.original.page_count))
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802
         if any(u.toLocalFile().lower().endswith(".pdf") for u in event.mimeData().urls()):
@@ -460,6 +649,7 @@ class MainWindow(QMainWindow):
     def set_busy(self, busy: bool) -> None:
         self.start_btn.setEnabled(not busy)
         self.test_btn.setEnabled(not busy)
+        self.report_view.regen_btn.setEnabled(not busy)
         self.cancel_btn.setEnabled(busy)
 
     def test_connection(self) -> None:
@@ -468,62 +658,60 @@ class MainWindow(QMainWindow):
         self._run(Worker("", settings, test_only=True))
 
     def start(self) -> None:
+        if self.worker is not None:
+            return
         if not self.src:
             QMessageBox.information(self, "提示", "请先选择一个 PDF 文件")
             return
         settings = self._collect()
-        if not settings.modes:
-            QMessageBox.information(self, "提示", "请至少选择一种输出方式")
-            return
         try:
             parse_pages(settings.pages, self.preview.original.page_count)
         except ValueError as e:
             QMessageBox.information(self, "提示", str(e))
             return
-        if not settings.resolved_api_key() and "localhost" not in settings.base_url:
-            reply = QMessageBox.question(self, "未填写 API Key", "没有填写 API Key，仍然继续吗？")
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-        self.log.appendPlainText(f"开始翻译 {Path(self.src).name} → {settings.target_lang}，模型 {settings.model}")
-        self.progress.setRange(0, 0)
+        if not settings.resolved_api_key():
+            QMessageBox.information(self, "提示", "请填写 API Key")
+            return
+        self.log.appendPlainText(f"开始翻译 {Path(self.src).name}，翻译模型 {settings.model}")
+        self.progress.setValue(0)
         self._run(Worker(self.src, settings))
 
     def cancel(self) -> None:
         if self.worker:
-            self.worker.cancel.set()
+            self.worker.cancel()
             self.status.setText("正在取消…")
 
-    @Slot(int, int, str)
-    def on_progress(self, done: int, total: int, msg: str) -> None:
-        self.progress.setRange(0, max(total, 1))
-        self.progress.setValue(done)
-        self.status.setText(msg)
-        self.log.appendPlainText(msg)
+    @Slot(float, str)
+    def on_progress(self, pct: float, msg: str) -> None:
+        self.progress.setValue(int(pct * 10))
+        self.status.setText(f"{pct:.0f}%  {msg}")
+        if not msg.endswith("）"):  # keep per-item counters out of the log
+            self.log.appendPlainText(msg)
 
     @Slot(object)
     def on_done(self, result) -> None:
-        self.progress.setRange(0, 1)
-        self.progress.setValue(1)
         if isinstance(result, str):  # connection test
             self.status.setText("连接成功")
-            self.log.appendPlainText(f"连接成功，测试译文：{result}")
-            QMessageBox.information(self, "连接成功", f"测试译文：\n{result}")
+            self.log.appendPlainText(result)
+            QMessageBox.information(self, "连接成功", result)
             return
         self.result = result
-        lines = [f"完成：{result.units} 段，新翻译 {result.translated} 段，缓存 {result.cached} 段"]
-        lines += [f"  {MODE_LABELS[m]}：{p}" for m, p in result.outputs.items()]
-        self.status.setText(lines[0])
-        self.log.appendPlainText("\n".join(lines))
-        if "mono" in result.outputs:
-            self.preview.set_translated(result.outputs["mono"], result.pages)
-        self.open_dual_btn.setEnabled(True)
+        self.progress.setValue(1000)
+        self.status.setText(f"完成，用时 {result.seconds / 60:.1f} 分钟。{result.report.summary()}")
+        self.log.appendPlainText(f"中文 PDF：{result.mono}")
+        if result.dual:
+            self.log.appendPlainText(f"双语对照 PDF：{result.dual}")
+        if result.mono:
+            self.preview.set_translated(result.mono, self._pages())
+        self.report_view.set_report(result.report)
+        self.open_btn.setEnabled(True)
         self.open_dir_btn.setEnabled(True)
+        if result.report.count("check") or result.report.count("english"):
+            self.log.appendPlainText("有需要检查的段落，见「质检报告」。")
 
     @Slot(str)
     def on_failed(self, msg: str) -> None:
-        self.progress.setRange(0, 1)
-        self.progress.setValue(0)
-        self.status.setText(f"失败：{msg}" if msg != "已取消" else msg)
+        self.status.setText(msg if msg == "已取消" else f"失败：{msg}")
         self.log.appendPlainText(msg)
         if msg != "已取消":
             QMessageBox.warning(self, "出错了", msg)
@@ -533,23 +721,24 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.job_thread = None
 
+    def jump_to_page(self, page: int) -> None:
+        self.tabs.setCurrentWidget(self.preview)
+        self.preview.go_translated(page - 1)
+
     def open_result(self) -> None:
-        if self.result:
-            outputs = self.result.outputs
-            path = outputs.get("dual") or outputs.get("mono") or next(iter(outputs.values()))
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        if self.result and self.result.mono:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.result.mono)))
 
     def open_output_dir(self) -> None:
-        if self.result:
-            folder = next(iter(self.result.outputs.values())).parent
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        if self.result and self.result.mono:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.result.mono.parent)))
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self.worker:
-            self.worker.cancel.set()
+            self.worker.cancel()
         if self.job_thread:
             self.job_thread.quit()
-            self.job_thread.wait(3000)
+            self.job_thread.wait(5000)
         self._collect()
         super().closeEvent(event)
 
@@ -558,6 +747,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv if argv is None else argv
     app = QApplication(argv)
     app.setStyle("Fusion")
+    app.setApplicationName("pdftrans")
     win = MainWindow()
     win.show()
     if len(argv) > 1 and os.path.isfile(argv[1]):

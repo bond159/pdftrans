@@ -1,0 +1,21 @@
+[project]
+name = "pdftrans"
+version = "0.2.0"
+description = "English-to-Chinese PDF translation that keeps the layout (BabelDOC engine, automatic proofreading, desktop GUI)"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+requires-python = ">=3.10,<3.14"
+dependencies = ["babeldoc==0.6.4", "PySide6>=6.6", "openai>=1.59", "pymupdf>=1.26.7"]
+
+[project.scripts]
+pdftrans-cli = "pdftrans.cli:main"
+
+[project.gui-scripts]
+pdftrans = "pdftrans.gui:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["pdftrans"]

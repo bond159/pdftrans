@@ -5,72 +5,65 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .config import LANGUAGES, OUTPUT_MODES, PRESETS, load_settings
-from .llm import TranslationCache, Translator, make_backend
-from .pipeline import translate_pdf
+from .config import PROOFREAD_MODES, load_settings
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="pdftrans",
-        description="用大模型翻译 PDF 并保留原排版。未指定的选项沿用 GUI 中保存的设置。",
+        description="把英文 PDF 翻译成中文并保留原版面（BabelDOC 引擎 + 自动校对）。未给出的选项沿用图形界面保存的设置。",
     )
     p.add_argument("pdf", nargs="+", help="要翻译的 PDF 文件")
-    p.add_argument("--preset", choices=list(PRESETS), help="服务商预设")
-    p.add_argument("--base-url", help="OpenAI 兼容接口地址，如 https://api.deepseek.com/v1")
-    p.add_argument("--api-key", help="API Key（也可用环境变量 PDFTRANS_API_KEY / ANTHROPIC_API_KEY）")
-    p.add_argument("--model", help="模型名称")
-    p.add_argument("--lang", choices=list(LANGUAGES), help="目标语言")
-    p.add_argument("--modes", help=f"输出方式，逗号分隔：{','.join(OUTPUT_MODES)}")
+    p.add_argument("--base-url", help="OpenAI 兼容接口地址，默认阿里云百炼")
+    p.add_argument("--api-key", help="API Key（也可用环境变量 DASHSCOPE_API_KEY）")
+    p.add_argument("--model", help="翻译模型，如 qwen-plus")
+    p.add_argument("--review-model", help="审校模型，如 qwen-max")
+    p.add_argument("--proofread", choices=list(PROOFREAD_MODES), help="自动校对：full / rules / off")
+    p.add_argument("--dual", action="store_true", default=None, help="同时输出左右双语对照 PDF")
     p.add_argument("--pages", help="页码范围，如 1-5,8")
-    p.add_argument("--concurrency", type=int)
+    p.add_argument("--glossary", help="术语表 CSV（列：source,target）")
     p.add_argument("--output-dir", "-o")
-    p.add_argument("--font", help="译文字体文件")
-    p.add_argument("--no-cache", action="store_true", help="不使用译文缓存")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     st = load_settings()
-    if args.preset:
-        st.preset = args.preset
-        st.provider, st.base_url, st.model = PRESETS[args.preset]
-        st.api_key = st.saved_keys.get(args.preset, "")
     for attr, value in [
         ("base_url", args.base_url),
         ("api_key", args.api_key),
         ("model", args.model),
-        ("target_lang", args.lang),
+        ("review_model", args.review_model),
+        ("proofread", args.proofread),
+        ("dual", args.dual),
         ("pages", args.pages),
-        ("concurrency", args.concurrency),
+        ("glossary_file", args.glossary),
         ("output_dir", args.output_dir),
-        ("font_file", args.font),
     ]:
         if value is not None:
             setattr(st, attr, value)
-    if args.modes:
-        st.modes = [m.strip() for m in args.modes.split(",") if m.strip() in OUTPUT_MODES]
-    if args.no_cache:
-        st.use_cache = False
+    if not st.resolved_api_key():
+        print("缺少 API Key：用 --api-key 指定，或设置环境变量 DASHSCOPE_API_KEY", file=sys.stderr)
+        return 2
 
-    translator = Translator(make_backend(st), st, TranslationCache() if st.use_cache else None)
+    from .engine import Job
 
-    def progress(done: int, total: int, msg: str) -> None:
-        print(f"\r[{done}/{total}] {msg}".ljust(70), end="", file=sys.stderr, flush=True)
+    def progress(pct: float, msg: str) -> None:
+        print(f"\r{pct:5.1f}%  {msg}".ljust(60), end="", file=sys.stderr, flush=True)
 
     status = 0
     for path in args.pdf:
         print(f"{path}:", file=sys.stderr)
         try:
-            result = translate_pdf(path, st, translator, progress)
+            result = Job(path, st, progress).run()
         except Exception as e:
             print(f"\n  失败：{e}", file=sys.stderr)
             status = 1
             continue
-        print(file=sys.stderr)
-        for out in result.outputs.values():
-            print(out)
+        print(f"\n  {result.report.summary()}", file=sys.stderr)
+        for out in (result.mono, result.dual):
+            if out:
+                print(out)
     return status
 
 

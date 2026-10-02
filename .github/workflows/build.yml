@@ -1,0 +1,59 @@
+name: build
+
+# Builds the desktop app for Windows and macOS. Runs on version tags (v0.2.0, ...)
+# and can be started by hand from the Actions tab. Tagged builds become a release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: pdftrans-windows-x64
+          - os: macos-latest
+            name: pdftrans-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+      - name: Run tests
+        run: python -m unittest discover -v
+      - name: Download layout model and fonts for bundling
+        run: babeldoc --generate-offline-assets build/assets
+      - name: Build
+        run: pyinstaller --noconfirm packaging/pdftrans.spec
+      - name: Make a sample PDF
+        run: python -c "from pathlib import Path; from tests.test_engine import make_pdf; make_pdf(Path('build/sample.pdf'))"
+      - name: Self-test the Windows build
+        if: runner.os == 'Windows'
+        run: dist/pdftrans/pdftrans-cli.exe --self-test build/sample.pdf
+      - name: Self-test the macOS build
+        if: runner.os == 'macOS'
+        run: dist/pdftrans.app/Contents/MacOS/pdftrans-cli --self-test build/sample.pdf
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path dist/pdftrans -DestinationPath ${{ matrix.name }}.zip
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: ditto -c -k --keepParent dist/pdftrans.app ${{ matrix.name }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}.zip
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.name }}.zip

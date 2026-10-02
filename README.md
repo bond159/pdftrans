@@ -1,104 +1,165 @@
-# pdftrans — 保留排版的 PDF 翻译器
+# pdftrans — 保留版面的 PDF 英译中
 
 英文（及其他语言）PDF 翻译成中文，排版保持不变。
 
-带图形界面的 PDF 翻译工具：调用大模型 API 翻译文字，把译文写回原来的位置，
-图片、表格线、背景色、页面尺寸都保持不变。输出效果类似「沉浸式翻译」的 PDF 翻译：
+把英文学术论文、教材等 PDF 翻译成简体中文：图片、公式、表格、页数和每段文字的位置都保持原样，
+只把英文正文换成中文。翻译后会**自动校对**，并给出一份**质检报告**，可以在界面里逐段核对、
+手动修改后重新生成。
 
-| 输出方式 | 说明 | 文件名 |
-| --- | --- | --- |
-| 仅译文 | 原排版，文字替换为译文 | `论文.zh-CN.mono.pdf` |
-| 双语对照 | 每页左边原文、右边译文 | `论文.zh-CN.dual.pdf` |
-| 双语交替 | 原文页后紧跟对应的译文页 | `论文.zh-CN.alt.pdf` |
+- 版面解析与排版引擎：[BabelDOC](https://github.com/funstory-ai/BabelDOC)（沉浸式翻译 PDF 功能背后的开源引擎）
+- 大模型：通义千问（阿里云百炼），也支持任何 OpenAI 兼容接口
+- 平台：Windows、macOS（也可以在 Linux 上从源码运行）
+
+## 主要功能
+
+| 功能 | 说明 |
+| --- | --- |
+| 保留版面 | 用版面识别模型区分正文、标题、图、表、公式；公式换成占位符保护起来，译文按原位置排版 |
+| 只译英文正文 | 公式、变量、引用编号 [12]、数字、网址、代码、人名保持原样 |
+| 术语一致 | 自动提取全文术语并统一译法；也可以导入自己的术语表 |
+| 自动校对 | 规则检查（占位符、数字、漏译、残留英文、长度异常）+ 第二个模型逐段审校并修正 |
+| 质检报告 | 列出被自动修正的段落和仍需人工检查的地方，双击跳到对应页面 |
+| 手动修改 | 在报告里改译文，重新生成 PDF 时只替换改过的段落，其余直接用缓存，不重复计费 |
+| 输出 | 默认只输出中文 PDF；可选同时输出左右双语对照版 |
 
 ## 安装
 
-需要 Python 3.10 及以上版本。
+### 直接下载（推荐）
+
+到 [Releases](../../releases) 页面下载：
+
+- Windows：`pdftrans-windows-x64.zip`，解压后双击 `pdftrans.exe`
+- macOS（Apple 芯片）：`pdftrans-macos-arm64.zip`，解压后把 `pdftrans.app` 拖到「应用程序」
+
+安装包已经内置版面识别模型和字体，首次运行不需要再下载。
+
+> macOS 首次打开会提示「无法验证开发者」，因为程序没有经过苹果签名。处理办法：在 Finder 里
+> 右键点 `pdftrans.app` → 打开 → 打开；或在终端运行 `xattr -cr /Applications/pdftrans.app`。
+
+### 从源码运行
+
+需要 Python 3.10–3.13：
 
 ```bash
 pip install -r requirements.txt
+python -m pdftrans            # 图形界面
 ```
+
+首次运行会自动下载版面识别模型和字体（约 150 MB，只需一次）。
+
+## 获取 API Key
+
+在[阿里云百炼控制台](https://bailian.console.aliyun.com/)开通「模型服务」，创建 API Key，
+填到程序的「API Key」里即可（Base URL 默认就是百炼的 `https://dashscope.aliyuncs.com/compatible-mode/v1`）。
+也可以设置环境变量 `DASHSCOPE_API_KEY`，界面里留空。
+
+> **关于 Token Plan / Coding Plan 订阅**：阿里云说明这两种订阅的 API Key 只能在 AI 编程工具和智能体工具里
+> 交互使用，禁止用于自定义程序、脚本和批量调用。本程序属于自定义程序，请使用百炼的**按量计费** API Key，
+> 以免账号受限。
+
+模型建议：翻译用 `qwen-plus`（速度快、费用低），审校用 `qwen-max`（更强）。两个都可以在界面里改成
+任何百炼支持的模型名。开启大模型审校后，每段大约多一次调用，费用约为只翻译时的两倍。
 
 ## 使用
 
-### 图形界面
+1. 把英文 PDF 拖进窗口（或点「选择 PDF…」）。
+2. 填写 API Key，点「测试连接」确认能用。
+3. 按需设置：页码范围、是否同时输出双语对照版、术语表、附加要求（如“这是一篇医学影像论文”）。
+4. 点「开始翻译」。右侧「预览」并排显示原文和中文版。
+5. 完成后看「质检报告」：
+   - **需要检查**：校对后仍不合格的段落（例如数字对不上、疑似漏译）
+   - **页面里的英文段落**：输出中仍是英文的较长段落（参考文献、代码、表格内容可以忽略）
+   - **已自动修正**：审校模型改过的段落，可以对照「审校前的译文」
+   - **手动修改**：你改过的段落
 
-```bash
-python -m pdftrans            # 打开窗口
-python -m pdftrans 论文.pdf   # 打开窗口并载入文件
-```
+   在下方编辑译文后点「保存我的修改」，再点「重新生成 PDF」。
 
-1. 把 PDF 拖进窗口（或点「选择 PDF…」）。
-2. 选择服务商，填入 API Key，按需修改模型名，可以先点「测试连接」。
-3. 选择目标语言和输出方式，点「开始翻译」。
-4. 右侧预览区并排显示原文和译文，可以翻页、缩放。点「打开结果 PDF」查看文件。
+输出文件（默认和原文件在同一文件夹）：
 
-设置会自动保存到 `~/.pdftrans/config.json`（API Key 也存在这里，文件权限为仅本人可读）。
-API Key 也可以留空，改用环境变量：OpenAI 兼容接口读 `PDFTRANS_API_KEY` 或 `OPENAI_API_KEY`，
-Claude 读 `ANTHROPIC_API_KEY`。
+| 文件 | 内容 |
+| --- | --- |
+| `论文.zh-CN.pdf` | 中文版 |
+| `论文.zh-CN.dual.pdf` | 左右双语对照版（勾选后才输出） |
+| `论文.zh-CN.report.json` | 质检报告 |
+| `论文.zh-CN.glossary.csv` | 自动提取的术语表，可以修改后作为下次的术语表使用 |
 
 ### 命令行
 
 ```bash
-python -m pdftrans --cli 论文.pdf --preset DeepSeek --api-key sk-... --lang zh-CN --modes mono,dual
-python -m pdftrans --cli a.pdf b.pdf --pages 1-5 -o 输出目录
+python -m pdftrans --cli 论文.pdf --api-key sk-xxx            # 源码运行
+pdftrans-cli 论文.pdf --dual --pages 1-5 -o 输出目录           # 安装包里的命令行程序
 ```
 
-没有给出的选项沿用图形界面里保存的设置。`python -m pdftrans --cli --help` 查看全部参数。
+`--help` 查看全部参数；没给出的选项沿用图形界面里保存的设置。
 
-## 支持的大模型
+### 术语表格式
 
-所有兼容 OpenAI `chat/completions` 协议的服务都能用，界面里内置了预设：
-OpenAI、DeepSeek、通义千问 (DashScope)、智谱 GLM、Moonshot (Kimi)、SiliconFlow、
-Ollama（本地模型，无需 Key）。其他服务选「自定义 OpenAI 兼容接口」并填写 Base URL 与模型名即可。
+UTF-8 编码的 CSV，表头为 `source,target`：
 
-也直接支持 Claude（Anthropic 官方 SDK），默认模型 `claude-opus-5-5`，可以在「推理强度」里
-选择 low / medium / high（翻译任务用 low 通常就够，速度快、费用低）。使用官方接口时会开启
-服务端兜底（`fallbacks: "default"`），模型拒答时自动换用备选模型重试；填写了自定义 Base URL
-（第三方中转）时不发送该参数。
+```csv
+source,target
+attention,注意力
+Transformer,Transformer
+large language model,大语言模型
+```
 
-## 选项说明
+译文必须使用术语表中的译法，审校时也会按术语表检查。
 
-- **页码范围**：如 `1-5,8`，留空表示全部页面。只输出所选页面。
-- **并发请求数 / 每批文本量**：多个段落会打包成一个请求（JSON 格式）发送，减少请求次数。
-  遇到限流 (HTTP 429) 时把并发调小。
-- **缓存译文**：译文按「模型 + 目标语言 + 提示词 + 原文」缓存在 `~/.pdftrans/cache.sqlite3`，
-  同一文件重新翻译（比如中途失败或取消后）不会重复计费。
-- **附加要求**：术语表或风格要求，会加入系统提示词，例如 `attention → 注意力`。
-- **字体**：默认译文用内置的 Droid Sans Fallback（中日韩）和 Times/Helvetica（西文），
-  可以指定自己的 `.ttf/.otf` 字体文件（如思源宋体）。输出时只嵌入用到的字形，文件不会明显变大。
+## 自动校对是怎么做的
 
-## 工作原理
+BabelDOC 把若干段落打包交给翻译模型，pdftrans 在结果返回 BabelDOC 排版之前插入校对：
 
-1. 用 PyMuPDF 读出每一行文字的位置、字号、颜色和字体，再按字号、行距、缩进、列表符号等
-   把行合并成段落（标题、正文、图注、表格单元格分别成段）。
-2. 跳过不需要翻译的内容：页码、纯数字、公式（数学字体或符号占比高）、网址、已是目标语言的文字。
-3. 把段落打包发给大模型翻译，提示词要求保留公式、引用、数字、网址不变。
-4. 用 redaction 只删除被翻译的那些文字（图片和矢量图形保持不动，也不画白底，背景色得以保留），
-   再在原位置排版译文：中日韩文按字断行、西文按词断行，避免标点出现在行首，保留粗体、颜色、
-   居中、两端对齐和列表缩进。译文放不下时先利用段落下方的空白，仍不够再缩小字号。
-5. 生成仅译文 / 左右对照 / 交替页三种 PDF。
+1. **规则检查**（每段都做，不花钱）：公式占位符和格式标记是否完整、原文中的数字是否都在、
+   是否有整句英文没翻、译文是否为空或长度明显异常。
+2. **大模型审校**：把原文、译文和规则检查结果一起交给审校模型，逐段判断准确性、漏译、术语，
+   有问题就给出修正后的译文。
+3. **防止改坏**：审校结果再过一遍规则检查，如果修改破坏了公式标记或引入新问题，就保留原译文。
+4. 「仅规则检查」模式下，不合格的段落会单独重新翻译一次。
+
+翻译结果（含校对结果）会缓存在本机，同一文件再次翻译或修改后重新生成时不会重复计费。
 
 ## 已知限制
 
-- 扫描版 PDF（整页是图片）没有可提取的文字，需要先做 OCR。
-- 竖排和旋转的文字保持原样不翻译。
-- 复杂公式与正文混排的段落会作为整体送去翻译，公式中的特殊符号可能变成普通字符。
+- 图片里的文字（截图、照片）不会翻译。
+- 扫描版 PDF 需要先用其他软件做 OCR；有 OCR 文字层的可以勾选「扫描版 PDF 兼容模式」。
+- 中英文长度不同，个别段落的字号会略微缩小以放进原位置。
 - 加密的 PDF 需要先解除密码。
 
 ## 开发
 
 ```bash
+pip install -r requirements.txt
 python -m unittest discover -v
 ```
 
-测试使用假的翻译后端，不会调用任何 API。代码结构：
+测试不调用真实接口：`tests/support/mock_llm.py` 模拟大模型接口，`tests/support/sandbox.py` 用一个
+基于规则的版面识别替代 BabelDOC 的神经网络模型，所以完整流程可以离线测试（BabelDOC 首次运行
+仍会下载字体）。
 
 | 文件 | 内容 |
 | --- | --- |
-| `pdftrans/layout.py` | 段落提取、过滤、断行排版、对照页生成 |
-| `pdftrans/llm.py` | OpenAI 兼容接口与 Claude 后端、批量翻译、缓存 |
-| `pdftrans/pipeline.py` | 整体流程：解析 → 翻译 → 排版 → 输出 |
-| `pdftrans/gui.py` | PySide6 图形界面 |
+| `pdftrans/engine.py` | 调用 BabelDOC 完成一次翻译：资源准备、进度、取消、输出命名 |
+| `pdftrans/translator.py` | 接入 BabelDOC 的翻译器：翻译、校对、手动修改、记录 |
+| `pdftrans/proofread.py` | 规则检查、审校提示词与结果解析 |
+| `pdftrans/qa.py` | 质检报告 |
+| `pdftrans/store.py` | 审校记录与手动修改的本地存储 |
+| `pdftrans/gui.py` | 图形界面（PySide6） |
 | `pdftrans/cli.py` | 命令行 |
-| `pdftrans/config.py` | 设置、服务商预设、页码解析 |
+| `packaging/` | PyInstaller 打包配置 |
+
+### 打包
+
+推送 `v` 开头的标签（如 `v0.2.0`）后，GitHub Actions 会在 Windows 和 macOS 上分别构建、
+自检（`pdftrans-cli --self-test`），并把安装包发布到 Releases；也可以在 Actions 页面手动运行 `build`。
+本地打包：
+
+```bash
+pip install pyinstaller
+babeldoc --generate-offline-assets build/assets
+pyinstaller packaging/pdftrans.spec
+```
+
+## 许可证
+
+[AGPL-3.0](LICENSE)。本程序基于 BabelDOC（AGPL-3.0）。自己使用没有限制；如果分发修改后的程序，
+或者用它对外提供网络服务，需要以同样的协议公开源代码。
